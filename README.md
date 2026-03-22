@@ -3,13 +3,13 @@
 ![nanochat logo](dev/nanochat.png)
 ![scaling laws](dev/scaling_laws_jan26.png)
 
-nanochat is the simplest experimental harness for training LLMs. It is designed to run on a single GPU node, the code is minimal/hackable, and it covers all major LLM stages including tokenization, pretraining, finetuning, evaluation, inference, and a chat UI. For example, you can train your own GPT-2 capability LLM (which cost ~$43,000 to train in 2019) for only $48 (~2 hours of 8XH100 GPU node) and then talk to it in a familiar ChatGPT-like web UI. On a spot instance, the total cost can be closer to ~$15. More generally, nanochat is configured out of the box to train an entire miniseries of compute-optimal models by setting one single complexity dial: `--depth`, the number of layers in the GPT transformer model (GPT-2 capability happens to be approximately depth 26). All other hyperparameters (the width of the transformer, number of heads, learning rate adjustments, training horizons, weight decays, ...) are calculated automatically in an optimal way.
+nanochat is the simplest experimental harness for training LLMs. The code is minimal/hackable, it covers all major LLM stages including tokenization, pretraining, finetuning, evaluation, inference, and a chat UI, and the default workflow in this branch is aligned around running end-to-end on a single laptop GPU such as an RTX Pro 500 Blackwell / B500. More generally, nanochat is configured out of the box to train an entire miniseries of compute-optimal models by setting one single complexity dial: `--depth`, the number of layers in the GPT transformer model. All other hyperparameters (the width of the transformer, number of heads, learning rate adjustments, training horizons, weight decays, ...) are calculated automatically in an optimal way.
 
 For questions about the repo, I recommend either using [DeepWiki](https://deepwiki.com/karpathy/nanochat) from Devin/Cognition to ask questions about the repo, or use the [Discussions tab](https://github.com/karpathy/nanochat/discussions), or come by the [#nanochat](https://discord.com/channels/1020383067459821711/1427295580895314031) channel on Discord.
 
 ## Time-to-GPT-2 Leaderboard
 
-Presently, the main focus of development is on tuning the pretraining stage, which takes the most amount of compute. Inspired by the modded-nanogpt repo and to incentivise progress and community collaboration, nanochat maintains a leaderboard for a "GPT-2 speedrun", which is the wall-clock time required to train a nanochat model to GPT-2 grade capability, as measured by the DCLM CORE score. The [runs/speedrun.sh](runs/speedrun.sh) script always reflects the reference way to train GPT-2 grade model and talk to it. The current leaderboard looks as follows:
+Presently, the main focus of development is on tuning the pretraining stage, which takes the most amount of compute. Inspired by the modded-nanogpt repo and to incentivise progress and community collaboration, nanochat maintains a historical leaderboard for a "GPT-2 speedrun", which is the wall-clock time required to train a nanochat model to GPT-2 grade capability, as measured by the DCLM CORE score. That leaderboard was established on 8xH100 nodes; in this branch, [runs/speedrun.sh](runs/speedrun.sh) is instead aligned to the single-GPU laptop baseline.
 
 | # | time | val_bpb | CORE | Description | Date | Commit | Contributors |
 |---|-------------|---------|------|-------------|------|--------|--------------|
@@ -21,27 +21,27 @@ Presently, the main focus of development is on tuning the pretraining stage, whi
 | 5 | 1.80 | 0.71808 | 0.2690 | autoresearch [round 1](https://x.com/karpathy/status/2031135152349524125) | Mar 9 2026 | 6ed7d1d | @karpathy |
 | 5 | 1.65 | 0.71800 | 0.2626 | autoresearch round 2 | Mar 14 2026 | a825e63 | @karpathy |
 
-The primary metric we care about is "time to GPT-2" - the wall clock time needed to outperform the GPT-2 (1.6B) CORE metric on an 8XH100 GPU node. The GPT-2 CORE score is 0.256525. In 2019, the training of GPT-2 cost approximately $43,000 so it is incredible that due to many advances over 7 years across the stack, we can now do so much faster and for well below $100 (e.g. at the current ~$3/GPU/hr, an 8XH100 node is ~$24/hr, so 2 hours is ~$48).
+The primary historical metric we care about is "time to GPT-2" - the wall clock time needed to outperform the GPT-2 (1.6B) CORE metric on an 8XH100 GPU node. The GPT-2 CORE score is 0.256525. In this branch the practical focus is different: keeping the training loop small, fast, and reproducible on a single B500-class laptop GPU.
 
 See [dev/LEADERBOARD.md](dev/LEADERBOARD.md) for more docs on how to interpret and contribute to the leaderboard.
 
 ## Getting started
 
-### Reproduce and talk to GPT-2
+### Run the laptop baseline
 
-The most fun you can have is to train your own GPT-2 and talk to it. The entire pipeline to do so is contained in the single file [runs/speedrun.sh](runs/speedrun.sh), which is designed to be run on an 8XH100 GPU node. Boot up a new 8XH100 GPU box from your favorite provider (e.g. I use and like [Lambda](https://lambda.ai/service/gpu-cloud)), and kick off the training script:
+The most fun you can have in this branch is to train the reference single-GPU model and talk to it. The entire pipeline to do so is contained in the single file [runs/speedrun.sh](runs/speedrun.sh), which is designed around one RTX Pro 500 Blackwell / B500-class laptop GPU:
 
 ```bash
 bash runs/speedrun.sh
 ```
 
-You may wish to do so in a screen session as this will take ~3 hours to run. Once it's done, you can talk to it via the ChatGPT-like web UI. Make sure again that your local uv virtual environment is active (run `source .venv/bin/activate`), and serve it:
+You may wish to do so in a screen session. Once it's done, you can talk to it via the ChatGPT-like web UI. Make sure again that your local uv virtual environment is active (run `source .venv/bin/activate`), and serve it:
 
 ```bash
 python -m scripts.chat_web
 ```
 
-And then visit the URL shown. Make sure to access it correctly, e.g. on Lambda use the public IP of the node you're on, followed by the port, so for example [http://209.20.xxx.xxx:8000/](http://209.20.xxx.xxx:8000/), etc. Then talk to your LLM as you'd normally talk to ChatGPT! Get it to write stories or poems. Ask it to tell you who you are to see a hallucination. Ask it why the sky is blue. Or why it's green. The speedrun is a 4e19 FLOPs capability model so it's a bit like talking to a kindergartener :).
+And then visit the URL shown. Then talk to your LLM as you'd normally talk to ChatGPT. The laptop baseline is intentionally much smaller than the old GPT-2 speedrun models, so treat it as a compact experimentation target rather than a GPT-2 replacement.
 
 ---
 
@@ -51,20 +51,22 @@ And then visit the URL shown. Make sure to access it correctly, e.g. on Lambda u
 
 A few more notes:
 
-- The code will run just fine on the Ampere 8XA100 GPU node as well, but a bit slower.
-- All code will run just fine on even a single GPU by omitting `torchrun`, and will produce ~identical results (code will automatically switch to gradient accumulation), but you'll have to wait 8 times longer.
-- If your GPU(s) have less than 80GB, you'll have to tune some of the hyperparameters or you will OOM / run out of VRAM. Look for `--device_batch_size` in the scripts and reduce it until things fit. E.g. from 32 (default) to 16, 8, 4, 2, or even 1. Less than that you'll have to know a bit more what you're doing and get more creative.
+- The reference scripts in this branch assume a single GPU first. Multi-GPU still works via `torchrun`, but it is no longer the documented default path.
+- If your laptop GPU has less VRAM than a B500, look for `--device-batch-size` in the scripts and reduce it until things fit.
+- For multi-GPU experiments, leave `--total-batch-size` at its default auto value unless you are intentionally pinning it for a specific setup.
 - Most of the code is fairly vanilla PyTorch so it should run on anything that supports that - xpu, mps, or etc, but I haven't personally exercised all of these code paths so there might be sharp edges.
 
 ## Research
 
-If you are a researcher and wish to help improve nanochat, two scripts of interest are [runs/scaling_laws.sh](runs/scaling_laws.sh) and [runs/miniseries.sh](runs/miniseries.sh). See [Jan 7 miniseries v1](https://github.com/karpathy/nanochat/discussions/420) for related documentation. For quick experimentation (~5 min pretraining runs) my favorite scale is to train a 12-layer model (GPT-1 sized), e.g. like this:
+If you are a researcher and wish to help improve nanochat, two scripts of interest are [runs/scaling_laws.sh](runs/scaling_laws.sh) and [runs/miniseries.sh](runs/miniseries.sh). See [Jan 7 miniseries v1](https://github.com/karpathy/nanochat/discussions/420) for related documentation. For quick experimentation on a single GPU, my favorite scale in this branch is a short d8 or d12 run, e.g. like this:
 
 ```
-OMP_NUM_THREADS=1 torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- \
-    --depth=12 \
-    --run="d12" \
-    --model-tag="d12" \
+OMP_NUM_THREADS=1 python -m scripts.base_train -- \
+    --depth=8 \
+    --total-batch-size=32768 \
+    --time-budget-seconds=300 \
+    --run="d8-laptop" \
+    --model-tag="d8-laptop" \
     --core-metric-every=999999 \
     --sample-every=-1 \
     --save-every=-1 \
@@ -90,7 +92,7 @@ nanochat does not use `torch.amp.autocast`. Instead, precision is managed explic
 
 | Hardware | Default dtype | Why |
 |----------|--------------|-----|
-| CUDA SM 80+ (A100, H100, ...) | `bfloat16` | Native bf16 tensor cores |
+| CUDA SM 80+ (A100, H100, RTX Pro 500 Blackwell, ...) | `bfloat16` | Native bf16 tensor cores |
 | CUDA SM < 80 (V100, T4, ...) | `float32` | No bf16; fp16 available via `NANOCHAT_DTYPE=float16` (uses GradScaler) |
 | CPU / MPS | `float32` | No reduced-precision tensor cores |
 
