@@ -52,6 +52,12 @@ parser.add_argument("--aspect-ratio", type=int, default=32, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="L", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+# Recurrent Depth (Huginn-style latent reasoning, arXiv:2502.05171)
+parser.add_argument("--n-prelude", type=int, default=0, help="prelude layers before shared recurrent core (0=dense)")
+parser.add_argument("--n-recurrent", type=int, default=0, help="layers in shared recurrent core (0=dense)")
+parser.add_argument("--n-coda", type=int, default=0, help="coda layers after recurrent core")
+parser.add_argument("--train-recurrence", type=int, default=4, help="fixed recurrence iterations during training")
+parser.add_argument("--k-backprop", type=int, default=4, help="last N iterations receive gradients (truncated backprop)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -147,6 +153,11 @@ def build_model_meta(depth):
         dfa_weight=args.dfa_weight,
         dfa_start_frac=args.dfa_start_frac,
         dfa_end_frac=args.dfa_end_frac,
+        n_prelude=args.n_prelude,
+        n_recurrent=args.n_recurrent,
+        n_coda=args.n_coda,
+        train_recurrence=args.train_recurrence,
+        k_backprop=args.k_backprop,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
