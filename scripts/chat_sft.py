@@ -31,6 +31,7 @@ from tasks.mmlu import MMLU
 from tasks.smoltalk import SmolTalk
 from tasks.customjson import CustomJSON
 from tasks.spellingbee import SimpleSpelling, SpellingBee
+from tasks.reasoning import OpusReasoning
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -66,6 +67,13 @@ parser.add_argument("--chatcore-max-sample", type=int, default=24, help="max pro
 # Data mixture
 parser.add_argument("--mmlu-epochs", type=int, default=3, help="number of epochs of MMLU in training mixture (teaches Multiple Choice)")
 parser.add_argument("--gsm8k-epochs", type=int, default=4, help="number of epochs of GSM8K in training mixture (teaches Math and Tool Use)")
+parser.add_argument("--reasoning-epochs", type=int, default=3, help="number of epochs of OpusReasoning in training mixture (teaches chain-of-thought reasoning)")
+# Thinking-block loss schedule (phased loss on <think>...</think> tokens)
+# Phase 1: 0 → phase1-end  : think weight = 1.0 (full gradient, learn what thinking is)
+# Phase 2: phase1-end → phase2-end: think weight linearly decays 1.0 → 0.5 (weaken)
+# Phase 3: phase2-end → 1.0 : think weight linearly decays 0.5 → 0.0 (pure next-token)
+parser.add_argument("--think-phase1-end", type=float, default=0.4, help="progress fraction where think weight starts decaying from 1.0")
+parser.add_argument("--think-phase2-end", type=float, default=0.8, help="progress fraction where think weight reaches 0.5 and continues to 0.0")
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
@@ -170,9 +178,10 @@ train_tasks = [
     *[GSM8K(subset="main", split="train") for _ in range(args.gsm8k_epochs)], # 8K rows per epoch
     SimpleSpelling(size=200000, split="train"), # 200K rows of Simple Spelling (e.g. spell the word 'apple')
     SpellingBee(size=80000, split="train"), # 80K rows of Spelling Bee (e.g. how many 'r' are in 'strawberry'?)
+    *[OpusReasoning(split="train") for _ in range(args.reasoning_epochs)], # ~9K rows per epoch of Opus chain-of-thought
 ]
 train_dataset = TaskMixture(train_tasks)
-print0(f"Training mixture: {len(train_dataset):,} rows (MMLU x{args.mmlu_epochs}, GSM8K x{args.gsm8k_epochs})")
+print0(f"Training mixture: {len(train_dataset):,} rows (MMLU x{args.mmlu_epochs}, GSM8K x{args.gsm8k_epochs}, Reasoning x{args.reasoning_epochs})")
 val_dataset = TaskMixture([
     SmolTalk(split="test"), # 24K rows in test set
     MMLU(subset="all", split="test", stop=5200), # 14K rows in test set, use only 5.2K to match the train ratios
@@ -212,7 +221,9 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
         nonlocal cursor, epoch
         while len(conv_buffer) < buffer_size:
             conversation = dataset[cursor]
-            ids, mask = tokenizer.render_conversation(conversation)
+            # Use thinking-aware tokenizer to capture mask=2 for <think> blocks.
+            # For conversations without <think> tags this is identical to render_conversation.
+            ids, mask = tokenizer.render_conversation_with_think(conversation)
             conv_buffer.append((ids, mask))
             cursor += ddp_world_size
             if cursor >= dataset_size:
@@ -289,24 +300,50 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
         inputs = batch_tensor[:, :-1].to(device=device, dtype=torch.int32, non_blocking=use_cuda).contiguous()
         targets = batch_tensor[:, 1:].to(device=device, dtype=torch.int64, non_blocking=use_cuda).contiguous()
 
-        # Apply the loss mask from render_conversation (mask=1 for assistant completions,
-        # mask=0 for user prompts, BOS, special tokens, tool outputs). mask[1:] aligns
-        # with targets (shifted by 1). Unmasked positions get -1 (ignore_index).
+        # Apply the loss mask from render_conversation_with_think.
+        # mask=0: not trained (user prompts, BOS, special tokens)
+        # mask=1: answer tokens (trained at full weight)
+        # mask=2: thinking tokens (trained at phase-dependent weight)
+        # Targets for mask=0 positions set to -1 (ignore_index for cross-entropy).
+        # Targets for mask=1 and mask=2 keep their actual token values; thinking-token
+        # weighting is applied in the training loop via the returned think_mask.
         mask_tensor = torch.tensor(mask_rows, dtype=torch.int8)
         mask_targets = mask_tensor[:, 1:].to(device=device)
         targets[mask_targets == 0] = -1
 
         # Mask out padding positions in targets (set to -1 = ignore_index)
-        # For each row, positions >= (content_length - 1) in targets should be masked
         for i, content_len in enumerate(row_lengths):
             if content_len < row_capacity:
                 targets[i, content_len-1:] = -1
 
-        yield inputs, targets
+        if split == "val":
+            # Validation: treat thinking tokens same as answer tokens (no weighting needed)
+            yield inputs, targets
+        else:
+            # Training: also yield a boolean mask for thinking-token positions so the
+            # training loop can apply phased loss weighting.
+            think_mask = (mask_targets == 2)  # (B, T-1) bool
+            yield inputs, targets, think_mask
 
 train_loader = sft_data_generator_bos_bestfit("train")
 build_val_loader = lambda: sft_data_generator_bos_bestfit("val")
 progress = 0 # will go from 0 to 1 over the course of the epoch
+
+# Phased thinking-block loss weight schedule.
+# The weight applied to <think>...</think> token losses during SFT.
+#   Phase 1 (0 → phase1_end):              weight = 1.0  (learn what thinking is useful)
+#   Phase 2 (phase1_end → phase2_end):     weight linearly decays 1.0 → 0.5  (weaken)
+#   Phase 3 (phase2_end → 1.0):            weight linearly decays 0.5 → 0.0  (pure next-token)
+def get_think_weight(progress):
+    p1, p2 = args.think_phase1_end, args.think_phase2_end
+    if progress < p1:
+        return 1.0
+    elif progress < p2:
+        frac = (progress - p1) / max(p2 - p1, 1e-8)
+        return 1.0 - 0.5 * frac  # 1.0 → 0.5
+    else:
+        frac = (progress - p2) / max(1.0 - p2, 1e-8)
+        return 0.5 * (1.0 - frac)  # 0.5 → 0.0
 
 # Learning rate schedule (linear warmup, constant, linear warmdown)
 # Same shape as base_train but uses progress (0→1) instead of absolute step counts,
@@ -328,7 +365,7 @@ def get_muon_momentum(it):
 
 # -----------------------------------------------------------------------------
 # Training loop
-x, y = next(train_loader) # prefetch the very first batch of data
+x, y, think_mask = next(train_loader) # prefetch the very first batch of data
 min_val_bpb = float("inf")
 smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
@@ -429,15 +466,32 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+    think_w = get_think_weight(progress)
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
+        # Phased thinking-block loss:
+        #   think_w == 0 → mask out thinking tokens, standard CE loss
+        #   think_w == 1 → train all tokens equally, standard CE loss (fast path)
+        #   0 < think_w < 1 → per-token weighted loss (slightly slower)
+        any_think = think_mask.any().item()
+        if not any_think or think_w == 1.0:
+            loss = model(x, y)
+        elif think_w == 0.0:
+            y_no_think = y.clone()
+            y_no_think[think_mask] = -1
+            loss = model(x, y_no_think)
+        else:
+            per_token_loss = model(x, y, loss_reduction='none').view(y.shape)  # (B, T)
+            valid = (y >= 0).float()
+            w = torch.where(think_mask, think_w, 1.0) * valid
+            denom = w.sum().clamp_min(1.0)
+            loss = (per_token_loss * w).sum() / denom
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
             scaler.scale(loss).backward()
         else:
             loss.backward()
-        x, y = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        x, y, think_mask = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
         progress = max(progress, approx_progress) # only increase progress monotonically
     # step the optimizer
     lrm = get_lr_multiplier(progress)
@@ -485,6 +539,7 @@ while True:
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
             "train/epoch": current_epoch,
+            "train/think_weight": think_w,
         })
 
     # The garbage collector spends ~500ms scanning for cycles quite frequently.
