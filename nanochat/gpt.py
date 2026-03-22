@@ -524,10 +524,11 @@ class GPT(nn.Module):
                     if targets is not None and layer_abs in self.config.dfa_layers:
                         dfa_hidden.append((layer_abs, x))
 
-                # Truncated backprop: detach states that are too far back
+                # Truncated backprop: detach the running state for early iterations.
+                # initial_state (prelude output) is intentionally NOT detached —
+                # it must stay connected so prelude parameters receive gradients.
                 if iteration < r - k_bp:
                     x = x.detach()
-                    initial_state = initial_state.detach()
 
             # Coda: standard transformer layers
             n_coda_start = n_pre + self.config.n_recurrent
