@@ -4,6 +4,79 @@ A running summary documenting some experiments and findings. Started ~Jan 7 2026
 
 ---
 
+## 2026-03-23: Recurrent Depth Latent Reasoning (Huginn-style, arXiv:2502.05171)
+
+### Motivation
+MoE is 2022-era tech. 2025-2026 literature (Huginn, ETD, MoR) shows recurrent depth is the key to test-time compute scaling: same parameters, variable reasoning depth at inference.
+
+### Architecture
+prelude(2 layers) → [core(8 layers, shared) × r] → coda(2 layers)
+- Train with r=4 fixed iterations (torch.compile compatible)
+- Test time: r can be 1, 4, 8, 16, 32 (zero VRAM cost!)
+- Truncated backprop: k_backprop=1 (only last iteration gets full gradient)
+- RecurrentAdapter: re-injects prelude output (initial_state) at each iteration
+
+### Bug Fixed
+initial_state (prelude output) must NOT be detached in truncated backprop.
+Detaching x (running state) is correct; detaching initial_state kills prelude gradients.
+Fix: only `x = x.detach()`, never `initial_state = initial_state.detach()`.
+
+### Experiment 1: Dense d12 Baseline (6GB Laptop)
+Commit: ae21e9d
+Stage: pretraining
+Config: depth=12, total_batch=32768, device_batch=8, 2000 steps
+val_bpb @ 250: 1.579380 | 500: 1.347932 | 750: 1.256308 | 1000: 1.206113
+val_bpb @ 1250: 1.173230 | 1500: 1.150192 | 1750: 1.134404 | 2000: 1.125693
+VRAM: 5556MB | tok/sec: ~33K | Training time: 33.5 min
+Params: 123M (value_embeds: 75M, matrices: 23M)
+
+### Experiment 2: Recurrent d12 r=4, k_bp=1 (6GB Laptop)
+Commit: 84ad518
+Stage: pretraining
+Config: n_prelude=2, n_recurrent=8, n_coda=2, r=4, k_bp=1, same batch settings
+val_bpb @ 250: 1.611256 | 500: 1.364217 | 750: 1.264370 | 1000: 1.212504
+val_bpb @ 1250: 1.177813 | 1500: 1.153842 | 1750: 1.137595 | 2000: 1.128451
+VRAM: 5140MB | tok/sec: ~40K | Training time: 26.9 min
+Params: 73M (value_embeds: 25M, matrices: 23M + adapter)
+Result: NEAR-MISS (0.003 bpb worse at step 2000, but 21% faster → WINS at same wall clock)
+
+### Wall-clock normalized comparison (27 min budget)
+- Dense: ~1620 steps → est. val_bpb ~1.147
+- Recurrent: 2000 steps → val_bpb 1.128  ← WINNER by ~0.019 bpb!
+
+### Experiment 3: k_backprop=2 (FAILED — 22× slower)
+k_backprop=2 degrades to ~1800 tok/sec (vs 40K). The activation graph for 2 gradient
+iterations is too complex for torch.compile/Triton on Blackwell laptop. REJECTED.
+k_backprop=1 is the only viable option.
+
+### Experiment 4: 4-4-4 split (n_prelude=4, n_recurrent=4, n_coda=4)
+Commit: 103f67c
+Config: same as Exp 2 but 4-4-4 instead of 2-8-2
+val_bpb @ 500: 1.352120 | 1000: 1.205174 | 1500: 1.147269 | 2000: **1.122361**
+VRAM: 5356MB | tok/sec: ~37K | Training time: 29.7 min
+Params: 97M (VE: 50M, matrices: 23M) — more VE layers = richer residual stream
+Result: **WIN** — beats dense baseline (1.122 < 1.126) at 11% less wall-clock time!
+
+Wall-clock normalized (30 min budget):
+- Dense: ~1795 steps → est. val_bpb ~1.130
+- 4-4-4 recurrent: 2000 steps → val_bpb 1.122  ← WINNER
+
+### Key findings
+1. Recurrent depth (4-4-4 split) beats dense d12 at same wall-clock time
+2. k_backprop=1 is required (k_backprop=2 is 22× slower on Blackwell laptop)
+3. initial_state must NOT be detached in truncated backprop (kills prelude gradients)
+4. DFA auxiliary loss has torch.compile issue: progress float triggers recompilation each step
+   Fix: pass dfa_weight_override (pre-computed tensor) instead of progress
+
+### Long run: 20K steps overnight
+Started: 2026-03-23 ~03:30
+Config: 4-4-4 recurrent, 20K steps, eval-every=2000, save-every=5000
+Expected total tokens: 20000 × 32768 = 655M tokens (vs 73M Chinchilla-optimal)
+ETA: ~5 hours (by ~08:30)
+Next: check val_bpb at step 2000, 4000, ..., 20000 — expect val_bpb < 1.0
+
+---
+
 ## 2026-03-04: Remove autocast, explicit dtype management, fp16 GradScaler
 
 Replaced `torch.amp.autocast` throughout the codebase with explicit dtype management via a single `COMPUTE_DTYPE` global. Also added fp16 training support with GradScaler.
