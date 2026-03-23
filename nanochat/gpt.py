@@ -469,7 +469,7 @@ class GPT(nn.Module):
         return block(x, ve, cos_sin, self.window_sizes[min(layer_idx, len(self.window_sizes)-1)], kv_cache)
 
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', progress=None,
-                recurrence: Optional[int] = None):
+                recurrence: Optional[int] = None, dfa_weight_override: Optional[float] = None):
         """
         Forward pass.
 
@@ -576,7 +576,11 @@ class GPT(nn.Module):
                 target_emb = self.transformer.wte(target_ids).to(x.dtype)
                 target_emb = norm(target_emb)
 
-                if progress is None:
+                # dfa_weight_override: pre-computed by caller (avoids torch.compile recompilation
+                # from progress float changing every step). Falls back to config.dfa_weight if None.
+                if dfa_weight_override is not None:
+                    effective_dfa_weight = dfa_weight_override
+                elif progress is None:
                     effective_dfa_weight = self.config.dfa_weight
                 elif progress <= self.config.dfa_start_frac:
                     effective_dfa_weight = self.config.dfa_weight
