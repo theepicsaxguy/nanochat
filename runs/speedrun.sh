@@ -69,20 +69,28 @@ python -m scripts.tok_eval
 echo "Waiting for dataset download to complete..."
 wait $DATASET_DOWNLOAD_PID
 
-# Laptop baseline: small enough to fit on a single B500 while still exercising the
-# full training stack. We pin the batch size instead of relying on the global auto
-# heuristic so the reference run stays stable across hardware.
+# Current 6GB Blackwell laptop baseline: recurrent d12 with a 4-4-4 split and
+# truncated backprop through only the last recurrent iteration. This is the
+# active single-GPU path tracked in dev/LOG.md. We keep a short wall-clock budget
+# here so speedrun remains a quick reference pipeline instead of an overnight run.
 python -m scripts.base_train \
-    --depth=8 \
-    --device-batch-size=16 \
+    --model-tag=d12 \
+    --depth=12 \
+    --n-prelude=4 \
+    --n-recurrent=4 \
+    --n-coda=4 \
+    --train-recurrence=4 \
+    --k-backprop=1 \
+    --device-batch-size=8 \
     --total-batch-size=32768 \
     --time-budget-seconds=300 \
+    --eval-tokens=5242880 \
     --core-metric-every=-1 \
     --sample-every=-1 \
     --save-every=-1 \
     --run=$WANDB_RUN
 # evaluate the model: CORE metric, BPB on train/val, and draw samples
-python -m scripts.base_eval --device-batch-size=16
+python -m scripts.base_eval --model-tag=d12 --device-batch-size=8
 
 # -----------------------------------------------------------------------------
 # SFT (teach the model conversation special tokens, tool use, multiple choice)
@@ -92,8 +100,8 @@ python -m scripts.base_eval --device-batch-size=16
 curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
 
 # run SFT and eval the model
-python -m scripts.chat_sft --device-batch-size=16 --run=$WANDB_RUN
-python -m scripts.chat_eval -i sft
+python -m scripts.chat_sft --model-tag=d12 --device-batch-size=8 --run=$WANDB_RUN
+python -m scripts.chat_eval -i sft --model-tag=d12
 
 # chat with the model over CLI! Leave out the -p to chat interactively
 # python -m scripts.chat_cli -p "Why is the sky blue?"
