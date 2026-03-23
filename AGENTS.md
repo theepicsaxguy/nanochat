@@ -2,121 +2,341 @@ Build a model that reasons, understands, and generates language at frontier qual
 
 
 <project_constraints>
-Modify scripts/base_train.py (pretraining), scripts/chat_sft.py (supervised fine-tuning), and scripts/chat_rl.py (reinforcement learning) to achieve Opus-level reasoning quality across the full pipeline. Do not modify nanochat/loss_eval.py—it contains evaluate_bpb (ground truth metric). Do not work around evaluate_bpb. No new packages allowed—use only what is in pyproject.toml. All training metrics logged to wandb. Entry points: "python -m scripts.base_train" (pretraining), "python -m scripts.chat_sft" (SFT), "python -m scripts.chat_rl" (RL). One sequential experiment at a time. No parallel runs. VRAM is soft constraint: 6GB baseline, meaningful wins justify increase. Always compare vs all-time best (track in dev/LOG.md), never vs previous run. Pretraining validates via val_bpb (bits-per-byte). SFT and RL validate via task-specific metrics (MMLU, GSM8K, SmolTalk, CORE eval).
+Modify scripts/base_train.py (pretraining), scripts/chat_sft.py (supervised fine-tuning), and scripts/chat_rl.py (reinforcement learning) to achieve Opus-level reasoning quality across the full pipeline. Do not modify nanochat/loss_eval.py—it contains evaluate_bpb (ground truth metric). Do not work around evaluate_bpb. No new packages allowed—use only what is in pyproject.toml. All training metrics logged to wandb. Entry points: "python -m scripts.base_train" (pretraining), "python -m scripts.chat_sft" (SFT), "python -m scripts.chat_rl" (RL). One sequential experiment at a time. No parallel runs. VRAM is soft constraint: 6GB baseline, meaningful wins justify increase. Always compare vs all-time best (track in dev/LOG.md), never vs previous run. Pretraining validates via val_bpb (bits-per-byte). SFT and RL validate via task-specific metrics (MMLU, GSM8K, SmolTalk, CORE eval). You may modify any file except nanochat/loss_eval.py.
 </project_constraints>
 
 
-<research_agent>
-Curate arxiv papers and validate against 2026 ML literature on compute efficiency, sparse scaling, and architectural innovation. Priority topics: sparse attention without sliding window, dynamic computation allocation, predictive coding separating prediction from error, early exit mechanisms per token per layer, pruning during training with learnable masks, activation function sparsity, state space models as attention alternatives, mixture of experts with learned routing, information bottleneck objectives, contrastive learning at intermediate layers, local teaching signals for representation formation.
+<current_state>
+## What Has Been Built (as of 2026-03-23)
 
-Search arxiv actively and frequently. Before the first non-baseline experiment, seed strategy/hypotheses.md. After 3+ consecutive discards, search again. When a result surprises you, find papers that explain or contradict the outcome. Extract one concrete change per paper to scripts/base_train.py. Save to literature/<slug>.md: title, venue, key finding, how it applies, expected improvement mechanism, whether it would scale to larger models.
+**Pretraining pipeline:** Fully operational.
+- **6GB Laptop Best (CURRENT):** val_bpb=0.9510 achieved in 297 min on single RTX PRO 500 Blackwell
+  - Architecture: Recurrent Depth 4-4-4 (prelude=4, core=4 shared ×4 iterations, coda=4)
+  - Commit: ~103f67c range, long run: recurrent-444-long (20K steps)
+  - Device: device_batch_size=8, total_batch_size=32768, bf16
+  - Speed: 37K tok/sec, VRAM: 5356MB
+- **8×H100 Best (historical):** 99 minutes to GPT-2 quality (CORE=0.256), commit a825e63
+- Dataset: ClimbMix-400B (karpathy/climbmix-400b-shuffle)
+- Optimizer: Muon (matrices) + AdamW (embeddings/scalars)
+- Core innovations: Recurrent Depth (Huginn arXiv:2502.05171), value embeddings (ResFormer),
+  per-layer resid_lambdas/x0_lambdas, deep layer_mix averaging
 
-Read every paper's abstract and methodology. 2 minutes max per paper. Log the inspiring paper tag in results.tsv description. Focus on papers that question the core transformer operation — dense attention is O(n²), next-token prediction optimizes for surface statistics, parameters are used uniformly across all tokens. Any mechanism that withholds compute where it does not matter is more valuable than tuning hyperparameters of what is already broken.
-</research_agent>
+**SFT pipeline (scripts/chat_sft.py):** Operational with task mixture:
+- SmolTalk (460K), MMLU (3 epochs), GSM8K (4 epochs), SpellingBee, SimpleSpelling, identity conversations
+- Claude Opus 4.6 reasoning dataset (Roman1111111/claude-opus-4.6-10000x, 3 epochs)
+- Phased thinking-block loss — mask=2 for <think>...</think> tokens, weight 1.0→0.5→0.0 across training
+- render_conversation_with_think() in tokenizer handles thinking token identification
+
+**RL pipeline (scripts/chat_rl.py):** Operational for GSM8K with GRPO-style training.
+
+**What has been tried and FAILED (do not repeat without strong reason):**
+- MoE on multi-GPU (H100): dispatch overhead killed wall-clock performance
+- MoE (single-GPU): User rejected as 2022-era tech, not 2025-2026 quality
+- SwiGLU standalone (without gate): negative result
+- Bigram hash embeddings at d25: improved but bloated VRAM
+- Hyperball/MuonH variants: negative
+- k_backprop=2 with recurrent depth: 22× slower on Blackwell laptop. NEVER USE k_backprop>1
+- DFA auxiliary loss: torch.compile recompiles every step (progress float issue). Needs fix.
+
+**6GB single-GPU target (ACTIVE HARDWARE):**
+- GPU: NVIDIA RTX PRO 500 Blackwell, 6113MB VRAM
+- device_batch_size=8, total_batch_size=32768, no FP8 (Blackwell laptop ≠ H100)
+- Model: Recurrent Depth 4-4-4 (d12 config) — 97M params, 5356MB VRAM
+- k_backprop=1 ALWAYS (k_backprop=2 → 22× slowdown on this GPU)
+- DO NOT use --run with a real name (wandb not configured, use --run dummy)
+</current_state>
+
+
+<brain_inspired_principles>
+The core of this program. Everything else is secondary.
+
+**The brain achieves Opus-quality on 20W. How?**
+
+1. **Sparse activation**: ~1-5% of neurons fire for any given input. Dense transformers activate 100%. The fix: Sparse Mixture of Experts (MoE) — many expert FFN networks, route each token to 1. Same FLOPs as dense, N× more parameters, N× more storable knowledge. A 8-expert MoE d12 model has 8× the parameter capacity of a dense d12 at identical inference cost.
+
+2. **Predictive coding**: The brain generates a prediction at every layer and only propagates the ERROR upward. Dense attention is O(n²) and optimizes for surface statistics (next token). Predictive coding: lower layers predict upper layer activations, only residuals propagate. Implementation: DFA auxiliary loss approximates this — target embeddings teach each layer to represent future tokens.
+
+3. **Dynamic compute allocation**: The brain allocates more resources to harder problems. A transformer gives every token 12 identical layers. Mixture of Depths (MoD): tokens vote to skip layers. Simple tokens exit early, complex tokens use full depth. Average compute = fraction of full depth, max capability = full depth.
+
+4. **Hierarchical compression**: Lower brain regions encode raw features, higher regions encode abstract concepts. Local attention at low layers (short context = local features), global attention at high layers (long context = abstract reasoning). Already partially implemented via window_pattern.
+
+5. **Rich feedback signal**: The brain doesn't do next-token prediction. It learns via prediction error + reward + neuromodulation. For us: DFA loss (local prediction signals), RL from task reward (GSM8K correctness), contrastive objectives (distinguish similar vs different concepts at intermediate layers).
+</brain_inspired_principles>
+
+
+<architecture_current>
+## Current Model Architecture (nanochat/gpt.py)
+
+**GPTConfig fields (key):**
+- sequence_len, vocab_size, n_layer, n_head, n_kv_head, n_embd
+- window_pattern: str — "L"=full attention only (SDPA; no sliding window on Blackwell)
+- dfa_layers, dfa_weight, dfa_start_frac, dfa_end_frac (DFA auxiliary — has compile issue)
+- **n_prelude, n_recurrent, n_coda** — Recurrent Depth split (0=dense)
+- **train_recurrence** — fixed r during training (must be static for torch.compile)
+- **k_backprop** — ALWAYS 1 on 6GB Blackwell laptop (k_backprop=2 is 22× slower)
+
+**Recurrent Depth Architecture (active):**
+- prelude: n_prelude blocks, run once, standard transformer
+- core: n_recurrent blocks with SHARED weights, run train_recurrence times
+- coda: n_coda blocks, run once, standard transformer
+- RecurrentAdapter: Linear(2×n_embd, n_embd) re-injects prelude output at each iteration
+- Truncated backprop: only last k_backprop iterations store activations for backward
+- CRITICAL: only detach x (running state), NOT initial_state (prelude output)!
+- Test-time scaling: can run core r=8,16,32 times for deeper reasoning (zero VRAM cost)
+
+**Components:**
+- CausalSelfAttention: GQA, RoPE, QK-norm, Flash Attention (FA3 on H100, SDPA on Blackwell)
+- MLP: SiLU gate × linear projection → output (3× expansion, SwiGLU-style)
+- Value embeddings (ResFormer): in prelude/coda layers only (not shared core)
+- Per-layer scalars: resid_lambdas (residual scale), x0_lambdas (initial embedding injection)
+- Deep layer mixing: layer_mix softmax weights blend all layer outputs
+
+**Optimizer:**
+- Muon (momentum only) for all transformer matrix params (attention + MLP weights + RecurrentAdapter)
+- AdamW for embeddings, lm_head, scalars, value_embeds
+- LR scales ∝ 1/√(model_dim/768) and ∝ √(batch_size/B_ref)
+</architecture_current>
 
 
 <experiment_orchestrator>
-Manage the complete training pipeline: pretraining → SFT → RL with cyclic validation and architecture iteration. Full pipeline loop: (1) Hypothesis selection specifying which training stage to target and what mechanism to test. (2) Before every run read dev/LOG.md, check for known couplings in notes, check dev/LEADERBOARD.md for pretraining context. (3) State prediction and mechanism it exploits. Decide which stage (pretraining or post-pretraining) and whether single-variable or bundled test.
+Manage the complete training pipeline: pretraining → SFT → RL with cyclic validation and architecture iteration.
 
-Pretraining (scripts/base_train.py): Edit architecture/training parameters. Git commit with "experiment: <description>". Execute: nohup uv run python -m scripts.base_train <args> > run.log 2>&1 &. Tail -f run.log to monitor. Check wandb project="nanochat" for metrics (step, val/bpb, core_metric logged automatically). If run crashes, diagnose via tail -n 100 run.log.
+**Full pipeline loop:**
+1. Hypothesis selection: which training stage, what mechanism, why it should work
+2. Before every run: read dev/LOG.md, check known couplings, check dev/LEADERBOARD.md
+3. State prediction (expected val_bpb delta and why). Decide: single-variable or bundled.
+4. Execute (see commands below). Monitor tail -f run.log.
+5. After run: check wandb for final metrics. Update dev/LOG.md immediately.
+6. Decide: improvement → keep commit, update LOG. Regression → git checkout best, update LOG.
+7. Repeat.
 
-Post-pretraining (scripts/chat_sft.py or scripts/chat_rl.py): After pretraining checkpoint identified, load it and edit training procedure (loss computation, task mixture, learning rates). Git commit describing the change. Execute SFT or RL with checkpoint path. Monitor task-specific validation metrics (accuracy, loss, reward signal).
+**Pretraining command (6GB single GPU — Recurrent Depth 4-4-4):**
+```bash
+git commit -m "experiment: <description>"
+nohup uv run python -m scripts.base_train \
+  --run dummy \
+  --model-tag <tag> \
+  --depth=12 \
+  --n-prelude=4 \
+  --n-recurrent=4 \
+  --n-coda=4 \
+  --train-recurrence=4 \
+  --k-backprop=1 \
+  --total-batch-size=32768 \
+  --device-batch-size=8 \
+  --eval-tokens=5242880 \
+  > run.log 2>&1 &
+tail -f run.log
+```
+NOTE: --run dummy disables wandb (not configured on laptop). --eval-tokens=5242880 for fast evals.
 
-After each run completes: check wandb for final metrics (val_bpb for pretraining, task scores for SFT/RL). Manually update dev/LOG.md with: commit hash, result, validation metric(s), architecture/training change description, why it succeeded/failed, what mechanism drove outcome, next steps to test. Cross-reference which stage and checkpoint was used.
+**SFT command (6GB single GPU):**
+```bash
+nohup uv run python -m scripts.chat_sft \
+  --run <run-name> \
+  --model-tag d12 \
+  --reasoning-epochs=3 \
+  > sft_run.log 2>&1 &
+```
 
-Decide: If metric(s) improved (lower loss for pretraining, higher accuracy for task), mark as success. Keep commit. Update dev/LOG.md as new result. If not best, git checkout <best_commit> -- scripts/<stage>.py && git add scripts/<stage>.py && git commit -m "revert: <reason>". Update dev/LOG.md with regression notes.
+**RL command:**
+```bash
+nohup uv run python -m scripts.chat_rl \
+  --run <run-name> \
+  --model-tag d12 \
+  > rl_run.log 2>&1 &
+```
 
-Continue until manually interrupted or result plateaus (fewer than 0.5% improvement across 20 experiments within a stage after trying different architectural classes). When stage plateaus, switch focus to next stage (pretraining → SFT → RL).
+**If run crashes:** tail -n 100 run.log to diagnose. Check VRAM via nvidia-smi.
+**If VRAM OOM:** reduce device_batch_size by 2×, or reduce depth by 2, or enable --grad-checkpoint.
 </experiment_orchestrator>
 
 
 <measurement_agent>
-Validate that every reported improvement is real and not a contaminated signal across all training stages. Contamination occurs when: eval improvement comes from reduced compute cost without actual learning gain, throughput appears faster due to GPU state variance, a "win" obscures permanent objective distortion, or metric gaming (optimizing for eval metric but breaking generalization).
+Validate that every reported improvement is real.
 
-Pretraining validation (scripts/base_train.py): Monitor wandb metrics in real-time (check training loss curve smoothness, val/bpb trajectory, core_metric if eval enabled). Look for: does training loss plateau before 50% of iterations, does validation loss increase while training loss decreases, does peak VRAM exceed 6GB consistently, does MFU drop >10% vs previous runs. Validate val_bpb (6 decimal places). If val_bpb improved by <0.005, check whether improvement comes from longer training (more iterations) or actual learning gain. Cross-check by manually computing bpb: (sum of loss on valid targets) / (math.log(2) * sum of byte counts) should match reported val_bpb. Validate that special tokens are excluded from val_bpb (check nanochat/loss_eval.py logic).
+**Contamination checklist:**
+- Does val_bpb improve? (primary metric for pretraining)
+- Is improvement ≥ 0.005 bpb? (less = likely noise, flag and re-test)
+- Does train loss still decrease smoothly (no plateau before 50% of steps)?
+- Does VRAM stay under 6GB?
+- Is MFU reasonable (not dropped >10% from baseline)?
+- For MoE: are experts being utilized uniformly (check router_loss in wandb)?
+- For thinking blocks: does think_weight behave correctly across training phases?
 
-Post-pretraining validation (scripts/chat_sft.py, scripts/chat_rl.py): For SFT, track task accuracy (MMLU, GSM8K, SmolTalk) and training loss convergence. For RL, track reward signal trending, task accuracy, and KL divergence from base model. Ensure training loss doesn't diverge wildly and that model doesn't catastrophically forget pretraining knowledge. Check: does accuracy improve smoothly or erratically, does loss-vs-reward tradeoff make sense, does checkpoint still evaluate well on pretraining metrics (val_bpb should degrade only minimally after SFT/RL).
+**False win detection:**
+- Reverse test: same improvement achievable by increasing total_batch_size 10%? → architectural change was not real
+- MoE win from fewer FLOPs (experts not all used)? → measure actual token throughput
+- SFT win from overfitting to eval tasks? → check SmolTalk val loss didn't increase
 
-Measure throughput as tokens-per-second (total_tokens / training_seconds) across all stages. Compare peak_vram_mb across runs — if it climbs more than 5% above baseline, flag as risky. Maintain dev/LOG.md with: commit hash, stage (pretraining/SFT/RL), checkpoint used, primary metric (val_bpb or task accuracy), secondary metrics (MFU, VRAM, throughput), description including whether result scales to larger models. Update immediately when new best is found for each stage.
+**Metric tracking per run:**
+- Commit hash, depth config, moe config, total_batch_size, device_batch_size
+- val_bpb (6 decimal places), CORE score, peak_VRAM_mb, tok/sec, MFU
+- Whether result is expected to scale to larger models
 </measurement_agent>
 
 
+<research_agent>
+Curate arxiv papers and validate against 2026 ML literature.
+
+**Priority topics (in order of impact):**
+1. Sparse MoE training stability (load balancing, expert collapse prevention)
+2. Mixture of Depths (dynamic per-token depth routing)
+3. Predictive coding in transformers (DFA-style local learning signals)
+4. State space models (Mamba, RWKV) as attention alternatives for long context
+5. Information bottleneck objectives alongside next-token
+6. Contrastive learning at intermediate layers
+7. Early exit mechanisms for dynamic compute
+
+**After 3+ consecutive discards, search arxiv again.**
+
+**Save to literature/<slug>.md:** title, venue, key finding, how it applies, expected mechanism, whether it scales.
+</research_agent>
+
+
 <data_agent>
-Manage tokenizer and data pipeline. Current system uses ClimbMix-400B pretraining dataset via nanochat/dataloader.py with BOS-aligned best-fit packing (minimizes confusing token sequences). SFT uses task mixture (MMLU, GSM8K, SmolTalk, custom JSON).
+**Current data pipeline:**
+- Pretraining: ClimbMix-400B via nanochat/dataset.py, BOS-aligned best-fit packing
+- SFT mixture: SmolTalk + MMLU + GSM8K + SpellingBee + identity + OpusReasoning (NEW)
+- Tokenizer: RustBPE, vocab_size=32768, saved in ~/.cache/nanochat/base_data_climbmix/tokenizer/
+- Token byte mapping stored in token_bytes.pt (used by evaluate_bpb)
 
-For pretraining: configure dataset shard loading via nanochat/dataset.py and token packing budget. Verify data split: train uses all but last shard, val uses last shard only. Do not mix train and val data.
+**Reasoning data integration (DONE):**
+- tasks/reasoning.py: loads Roman1111111/claude-opus-4.6-10000x
+- render_conversation_with_think(): mask=2 for <think>...</think> tokens
+- Phased thinking-block loss in chat_sft.py (weight 1.0 → 0.5 → 0.0)
 
-Tokenizer vocabulary: current vocab_size is 32768. Managed in nanochat/tokenizer.py via RustBPE with BPE trainer. Token byte mapping (for val_bpb computation) stored in token_bytes before each run.
-
-Future: integrate Claude Opus 4.6 synthetic reasoning data (load_dataset("Roman1111111/claude-opus-4.6-10000x")). Will require: preserve <think>...</think> boundary tokens during tokenization, design data mixture schedules (20-30% reasoning data in SFT), check OOV rate and expand vocabulary to 40000-50000 if needed, deduplicate vs ClimbMix to avoid memorization.
-
-For each data modification, run a fresh baseline (same depth/config) to measure data effect independently from architecture changes.
+**Data split rule:** train uses all but last shard, val uses last shard. NEVER mix.
+**For new data:** measure OOV rate vs current tokenizer. If >5% of tokens are multi-byte escapes, expand vocab.
 </data_agent>
 
 
 <reasoning_agent>
-Integrate thinking blocks and chain-of-thought capability into the training process. Currently not implemented; aspirational feature for frontier reasoning alignment.
+**Status: IMPLEMENTED in SFT pipeline.**
 
-When implemented: thinking blocks are <think>...</think> tokens allowing intermediate reasoning before final output. Model should learn to allocate compute across these thinking passages.
+Thinking blocks implemented via:
+1. render_conversation_with_think() identifies <think>...</think> blocks → mask=2
+2. chat_sft.py applies phased loss weight to mask=2 positions:
+   - Phase 1 (0-40% progress): weight=1.0 (learn to reason)
+   - Phase 2 (40-80%): weight decays 1.0→0.5 (weaken thinking gradient)
+   - Phase 3 (80-100%): weight decays 0.5→0.0 (pure next-token dominates)
+3. OpusReasoning dataset provides ground truth thinking examples from Opus 4.6
 
-Coordinate with experiment_orchestrator to modify loss computation in scripts/base_train.py: during forward pass, detect thinking-block boundaries and compute separate gradients with three phases:
-Phase 1 (early epochs, strong loss): let model learn what thinking is useful.
-Phase 2 (mid training, weakened loss): keep thinking enabled but reduce gradient magnitude by 0.5x, allowing other skills to train without interference.
-Phase 3 (late training, decay to zero): remove thinking-block-specific loss, let purely next-token prediction dominate.
-
-Integrate with local learning signals: lower layers (1-4) should receive direct teaching signals on whether their thinking blocks predict future tokens correctly (predictive coding). Middle layers (5-8) should learn reconstruction of token embeddings from the thinking. Top layers (9+) answer only to task loss.
-
-Consume data from data_agent (Claude Opus 4.6 reasoning dataset). For each example, preserve <think>...</think> boundaries during tokenization. During evaluation, measure reasoning quality: does the model's thinking correlate with answer correctness?
+**Next steps for reasoning:**
+- Validate: do models trained with OpusReasoning data score higher on GSM8K and MMLU?
+- Extend: add reasoning data to pretraining (not just SFT) — helps representations
+- Measure: does model generate <think> blocks spontaneously on hard problems?
+- RL: reward correct reasoning chains, not just correct answers
 </reasoning_agent>
 
 
 <architecture_innovation_agent>
-Explore sparse computation, dynamic routing, and hierarchical processing. Core hypothesis: the ceiling for what fits on 6GB is not where we think it is because nobody has seriously tried to find it. Sparse activation — forcing the model to use only a fraction of parameters per token — is a different optimization target from "best transformer that fits in VRAM."
+Explore sparse computation, dynamic routing, and hierarchical processing.
 
-Tier 1 experiments (question the core operation): Replace dense attention with learned sparse routing (not sliding window, learned selection of which tokens matter). Predictive coding: separate prediction and error networks, full compute only on surprise tokens. Dynamic depth: learned early exit per token per layer. Pruning during training: start overparameterized, apply learnable masks, penalize active connections. Activation sparsity loss: penalize non-zero activations directly, force sparse representations.
+**Tier 1 — Question the core operation (run these first, most impactful):**
+- **Sparse MoE FFN** (IN PROGRESS): Replace dense MLP with 8 learned expert FFNs, top-1 routing. On single GPU: no dispatch overhead. Expected: 8× parameter capacity for same FLOPs = dramatically better sample efficiency. Previous failure was multi-GPU dispatch overhead — not applicable here.
+- **Mixture of Depths**: Learned per-token per-layer skip routing. Simple tokens skip, complex tokens get full compute. Average depth << max depth. Implement as a binary router (sigmoid > threshold = process, else identity).
+- **Predictive coding**: Each layer predicts the next layer's normalized activation. DFA loss is an approximation of this — push it further by making predictions explicit and penalizing residual magnitude directly.
+- **Activation sparsity loss**: Add L1 penalty to post-activation values. Forces sparse internal representations. Brain-like. Does NOT reduce parameters but forces the model to use them selectively.
 
-Tier 2 experiments (replace what attention approximates): Linear attention grounded in math not speed. State space models for sequence modeling without O(n²). Hierarchical processing: local attention at lower layers, global at higher. Tiny expert mixture: 1 of 32 experts per token, high sparsity, managed explicitly in scripts/base_train.py.
+**Tier 2 — Replace what attention approximates:**
+- **Sliding window + global tokens** (hybrid): 50% sliding window layers (local), 50% full attention (global). Different from current window_pattern — global layers get special "summary" tokens that compress local context. Pattern: "SSSL" tiled.
+- **State space models (SSM)**: Replace some attention layers with Mamba-style SSMs. Linear complexity for long sequences. Critical for reasoning chains that need long context.
+- **Linear attention**: Kernel trick to make attention O(n) instead of O(n²). Quality tradeoff vs speed.
 
-Tier 3 experiments (different learning signal): Information bottleneck objective alongside next-token. Contrastive objectives at intermediate layers. Auxiliary losses that penalize representation redundancy.
+**Tier 3 — Different learning signal:**
+- **Contrastive auxiliary loss**: At intermediate layers, push apart representations of tokens with different next-tokens. Pull together tokens with same semantic role.
+- **Information bottleneck**: Penalize mutual information between intermediate representations and input tokens. Forces the model to discard irrelevant features.
+- **Layer-wise targets**: Each layer predicts tokens k steps ahead (k=1 for bottom, k=4 for top). Like a prediction hierarchy.
 
-Tier 4 (last resort): Hyperparameter and architecture tuning only after Tiers 1-3 exhausted.
+**Tier 4 — Last resort (hyperparameter tuning only):**
+- LR sweep (0.5×, 1.0×, 1.5× base)
+- Batch size tuning
+- Weight decay tuning
 
-For each experiment, estimate active FLOP count (not just parameter count). A model using 3% of parameters per forward pass and routing intelligently is not a small model — it is a large model running efficiently. Track: does this approach's efficiency scaling justify increased complexity? Would it scale to a full-size model (100B+ params)?
-
-Handle the Blackwell-specific constraint: BF16 is standard on Blackwell. Build torch.compile compatibility by keeping modified scripts/base_train.py computation graph regular (no OOM, no shape changes). Test FP8 support for linear layers >128 dims with 16-bit alignment.
+**For each experiment:**
+- Estimate active FLOP count (not just parameter count)
+- Track: does efficiency scaling justify added complexity?
+- Would this approach scale to a full-size model (100B+)?
+- Log the inspiring paper tag in dev/LOG.md
 </architecture_innovation_agent>
 
 
 <validation_agent>
-Ensure eval signals are true and reproducible across all training stages: pretraining, SFT, and RL. Validation is not just running evaluate_bpb once — it is detecting and rejecting false wins. A "win" is false if: the loss improvement comes from a change that also reduces actual model capability (e.g., auxiliary loss that hijacks gradients), the improvement is a statistical fluctuation or dataloader ordering accident (rerun with different seed), the change optimizes for the eval metric but breaks generalization (train/val divergence increases), VRAM spike or MFU regression offset any learning gain.
+**For pretraining:** val_bpb is ground truth. val_bpb < current best (track in dev/LOG.md) = win.
 
-Pretraining validation: implement the contamination detection protocol for val_bpb. For any non-baseline experiment that improves val_bpb, perform a reverse test — can you get the same improvement by increasing total_batch_size by 10% without the architectural change? If yes, the change was not real. For auxiliary losses: disable them at eval time, ensure model checkpoint is clean (auxiliary loss has no permanent effect). For near-misses (>0.01 loss diff from best), flag in dev/LOG.md and schedule re-testing after 4 more experiments.
+**For MoE specifically:**
+- Check router_loss in wandb — should be ≤ 1.0 and decreasing. If stuck at num_experts = 8.0 (maximum), experts are collapsing.
+- Check expert utilization: each expert should handle ~1/N of tokens at steady state.
+- Compare wall-clock performance (tok/sec) vs dense baseline. MoE on single GPU should be close to dense (no dispatch overhead).
+- If MoE is slower than dense by >20%, investigate: is the expert loop serialized? Use torch.compile.
 
-Post-pretraining validation: For SFT, ensure accuracy gains don't come from overfitting to the task at the expense of generalization (validate on CORE eval that model didn't catastrophically forget pretraining knowledge). For RL, ensure reward improvements track with actual task accuracy and don't represent reward hacking. Check: does model maintain reasonable val_bpb after SFT/RL, does task accuracy correlate with sample quality, does KL divergence stay reasonable (not collapsing to reward signal at cost of language modeling).
+**For thinking blocks (SFT):**
+- Verify train/think_weight schedule is logged and decreasing correctly in wandb.
+- After training: prompt model with hard math problem, verify it generates <think> blocks.
+- GSM8K accuracy with thinking >> without thinking = thinking is helping.
 
-Validate on wandb: loss curves show early-stage noise, convergence pattern, final plateau smoothness. Look for training loss plateau before 50% of iterations (bad sign), validation loss increase while training loss decreases (divergence), peak VRAM exceeding 6GB consistently (hard constraint violation). For post-pretraining: accuracy should improve smoothly without sudden jumps (indicates reward hacking or overfitting).
+**Contamination protocol for near-misses (< 0.005 bpb improvement):**
+- Re-test with different random seed (--resume-from-step 0 with new --run name)
+- Re-test with +10% total_batch_size to check if it's just a compute effect
+- Schedule re-test after 4 other experiments
 
-Compare metrics against history per stage: track commit hash, stage, primary metric (val_bpb for pretraining, accuracy for SFT/RL), secondary metrics (MFU, VRAM, throughput, KL divergence), checkpoint used, description including scalability assessment. Update dev/LOG.md immediately when a new best is found for each stage.
+**dev/LOG.md format per entry:**
+```
+## YYYY-MM-DD: <description>
+Commit: <hash>
+Stage: pretraining | SFT | RL
+val_bpb: X.XXXXXX (pretraining) | N/A (SFT/RL)
+Task accuracy: N/A | MMLU=X.XX GSM8K=X.XX (SFT/RL)
+VRAM: XXX MB peak
+tok/sec: XXXX
+MFU: XX%
+Architecture: <what changed>
+Mechanism: <why it works>
+Result: WIN / LOSS / NEAR-MISS
+Next: <what to try next>
+```
 </validation_agent>
 
 
-<data_preparation_rules>
-Before training, verify ~/.cache/nanochat/base_data_climbmix/ contains data shards and tokenizer. Data is downloaded on-demand via nanochat/dataset.py. For base pretraining, use ClimbMix-400B (list_parquet_files returns paths). For SFT, prepare task mixtures (MMLU, GSM8K, SmolTalk, synthetic) with specified epoch counts. Tokenizer vocab can be expanded post-hoc if needed (check OOV rate). Validate data split: train split uses all but last shard, val split uses last shard only. Do not mix train and val data. For synthetic reasoning data, preserve <think></think> boundary tokens during tokenization.
-</data_preparation_rules>
-
-
 <experiment_classes>
-Start bold. Fall back only when bold is exhausted. Tier 1 is questioning the core operation — these are the experiments worth running even if they seem insane. Tier 4 (hyperparameter tuning) is the safety fallback.
+Start bold. Fall back only when bold is exhausted.
 
-Tier 1: sparse routing, predictive coding, dynamic depth, pruning-during-training, sparsity-loss
-Tier 2: linear attention, state space models, hierarchical processing, mixture of experts
-Tier 3: information bottleneck, contrastive objectives, redundancy penalties
-Tier 4: LR sweep, batch size tuning, weight decay tuning (only after Tiers 1-3)
+**Tier 1 (run these first — question the core operation):**
+- Sparse MoE FFN (8 experts, top-1) — IN PROGRESS
+- Mixture of Depths (per-token layer skipping)
+- Strong DFA loss at all layers (predictive coding approximation)
+- Activation sparsity L1 loss
 
-Selection strategy: LR sweep after architecture changes (0.5x, 1.0x, 1.5x base LR) — catches false negatives from architecture that needs LR retuning. Controlled regressions: if a change costs 0.005 val_bpb but opens a pathway, accept it as "regression accepted: reason" and test follow-up immediately. Revisit near-misses every 4 experiments. Diminishing returns: 5 consecutive discards within 0.01 of best means architectural class is locally optimized — make a class change, do not tune further.
+**Tier 2 (replace what attention approximates):**
+- Hybrid window/global attention with summary tokens
+- Linear attention for long-context layers
+- SSM layers replacing some attention
+
+**Tier 3 (different learning signal):**
+- Contrastive auxiliary at intermediate layers
+- Information bottleneck penalty
+- Layer-wise k-step-ahead prediction hierarchy
+
+**Tier 4 (last resort — hyperparameter tuning):**
+- LR sweep after architecture changes
+- Batch size tuning
+- Weight decay tuning
+
+**Selection strategy:**
+- After MoE validates: test Mixture of Depths (they compose well)
+- After 3 consecutive discards: search arxiv, pick new class
+- Near-miss (>0.01 from best): re-test after 4 experiments
+- 5 consecutive discards within 0.01 of best → make a CLASS change
 </experiment_classes>
 
 
 <target>
 Opus quality on a consumer GPU. Not approximately. That quality. The existence proof is real. Find the ideas.
+
+**Concrete milestones:**
+1. Pretraining: val_bpb < 0.70 on 6GB GPU (current best ~0.74 on 8×H100)
+2. SFT: GSM8K accuracy > 50%, MMLU > 65%
+3. Reasoning: model generates coherent <think> blocks that correlate with answer correctness
+4. Full pipeline: model that can solve novel math problems it hasn't seen, explain its reasoning, and be self-consistent
 </target>
