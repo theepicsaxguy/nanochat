@@ -21,7 +21,7 @@ from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state
 from nanochat.loss_eval import evaluate_bpb
 import torch.distributed as dist
-from nanochat.flash_attention import HAS_FA3
+from nanochat.flash_attention import HAS_FA3, USE_FA3, FA3_KERNEL_REPO, FA3_UNAVAILABLE_REASON, FA3_BUILD_VARIANT, FA3_MODULE_FILE
 from nanochat.engine import Engine
 from scripts.chat_eval import run_chat_eval
 
@@ -89,16 +89,35 @@ if device_type == "cuda":
     gpu_device_name = torch.cuda.get_device_name(0)
     gpu_peak_flops = get_peak_flops(gpu_device_name)
     print0(f"GPU: {gpu_device_name} | Peak FLOPS (BF16): {gpu_peak_flops:.2e}")
+    print0(f"MFU basis: using {gpu_peak_flops:.2e} BF16 FLOPS per GPU across {ddp_world_size} rank(s)")
 else:
     gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
+    gpu_device_name = str(device)
+user_config["gpu_name"] = gpu_device_name
+if device_type == "cuda":
+    user_config["gpu_peak_flops_bf16"] = gpu_peak_flops
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-sft", name=args.run, config=user_config)
 
 # Flash Attention status
-if not HAS_FA3:
+if USE_FA3:
+    print0(f"✓ Using Flash Attention 3 via {FA3_KERNEL_REPO}")
+    if FA3_BUILD_VARIANT is not None:
+        print0(f"✓ FA3 build variant: {FA3_BUILD_VARIANT}")
+    if FA3_MODULE_FILE is not None:
+        print0(f"✓ FA3 module: {FA3_MODULE_FILE}")
+elif HAS_FA3 and COMPUTE_DTYPE != torch.bfloat16:
+    print0(f"WARNING: FA3 is available via {FA3_KERNEL_REPO}, but COMPUTE_DTYPE={COMPUTE_DTYPE}; using SDPA fallback.")
+else:
     print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback. Training will be less efficient.")
+    if FA3_KERNEL_REPO is not None and FA3_UNAVAILABLE_REASON is not None:
+        print0(f"WARNING: FA3 repo '{FA3_KERNEL_REPO}' failed runtime probe: {FA3_UNAVAILABLE_REASON}")
+    if FA3_BUILD_VARIANT is not None:
+        print0(f"WARNING: Attempted FA3 build variant: {FA3_BUILD_VARIANT}")
+    if FA3_MODULE_FILE is not None:
+        print0(f"WARNING: Attempted FA3 module: {FA3_MODULE_FILE}")
 
 # Load the model and tokenizer
 model, tokenizer, meta = load_model("base", device, phase="train", model_tag=args.model_tag, step=args.model_step)
@@ -210,12 +229,24 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
     row_capacity = args.max_seq_len + 1  # +1 for target at last position
     bos_token = tokenizer.get_bos_token_id()
 
-    # Conversation buffer: list of (token_ids, loss_mask) tuples
+    use_cuda = device_type == "cuda"
+
+    # Conversation buffer: list of (token_ids, loss_mask, length) tensors on CPU.
     conv_buffer = []
     cursor = ddp_rank  # Each rank processes different conversations (for fetching)
     consumed = ddp_rank  # Track actual consumption separately from buffering
     epoch = 1
     it = 0  # iteration counter
+
+    # Persistent staging buffers to avoid re-allocating tensors every batch.
+    row_tokens = torch.empty((args.device_batch_size, row_capacity), dtype=torch.long)
+    row_masks = torch.empty((args.device_batch_size, row_capacity), dtype=torch.int8)
+    cpu_inputs = torch.empty((args.device_batch_size, args.max_seq_len), dtype=torch.int32, pin_memory=use_cuda)
+    cpu_targets = torch.empty((args.device_batch_size, args.max_seq_len), dtype=torch.int64, pin_memory=use_cuda)
+    cpu_mask_targets = torch.empty((args.device_batch_size, args.max_seq_len), dtype=torch.int8, pin_memory=use_cuda)
+    inputs = torch.empty((args.device_batch_size, args.max_seq_len), dtype=torch.int32, device=device)
+    targets = torch.empty((args.device_batch_size, args.max_seq_len), dtype=torch.int64, device=device)
+    mask_targets = torch.empty((args.device_batch_size, args.max_seq_len), dtype=torch.int8, device=device)
 
     def refill_buffer():
         nonlocal cursor, epoch
@@ -224,7 +255,9 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
             # Use thinking-aware tokenizer to capture mask=2 for <think> blocks.
             # For conversations without <think> tags this is identical to render_conversation.
             ids, mask = tokenizer.render_conversation_with_think(conversation)
-            conv_buffer.append((ids, mask))
+            conv = torch.tensor(ids, dtype=torch.long)
+            conv_mask = torch.tensor(mask, dtype=torch.int8)
+            conv_buffer.append((conv, conv_mask, conv.numel()))
             cursor += ddp_world_size
             if cursor >= dataset_size:
                 cursor = cursor % dataset_size
@@ -232,51 +265,47 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
                 # Note: last_step is now triggered based on consumption, not fetching
 
     while True:
-        rows = []
-        mask_rows = []
         row_lengths = []  # Track actual content length (excluding padding) for each row
-        for _ in range(args.device_batch_size):
-            row = []
-            mask_row = []
+        for row_idx in range(args.device_batch_size):
+            row_tokens[row_idx].fill_(bos_token)
+            row_masks[row_idx].zero_()
+            pos = 0
             padded = False
-            while len(row) < row_capacity:
+            content_len = row_capacity
+            while pos < row_capacity:
                 # Ensure buffer has conversations
                 while len(conv_buffer) < buffer_size:
                     refill_buffer()
 
-                remaining = row_capacity - len(row)
+                remaining = row_capacity - pos
 
                 # Find largest conversation that fits entirely
                 best_idx = -1
                 best_len = 0
-                for i, (conv, _) in enumerate(conv_buffer):
-                    conv_len = len(conv)
+                for i, (_, _, conv_len) in enumerate(conv_buffer):
                     if conv_len <= remaining and conv_len > best_len:
                         best_idx = i
                         best_len = conv_len
 
                 if best_idx >= 0:
                     # Found a conversation that fits - use it entirely
-                    conv, conv_mask = conv_buffer.pop(best_idx)
-                    row.extend(conv)
-                    mask_row.extend(conv_mask)
+                    conv, conv_mask, conv_len = conv_buffer.pop(best_idx)
+                    row_tokens[row_idx, pos:pos + conv_len].copy_(conv)
+                    row_masks[row_idx, pos:pos + conv_len].copy_(conv_mask)
+                    pos += conv_len
                     consumed += ddp_world_size  # Track actual consumption
                 else:
                     # No conversation fits - pad the remainder instead of cropping
                     # This ensures we never discard any tokens
-                    content_len = len(row)
-                    row.extend([bos_token] * remaining)  # Pad with BOS tokens
-                    mask_row.extend([0] * remaining)
+                    content_len = pos
                     padded = True
-                    break  # Row is now full (with padding)
+                    break  # Row is already pre-filled with BOS/zero mask padding
 
             # Track content length: full row if no padding, otherwise the length before padding
             if padded:
                 row_lengths.append(content_len)
             else:
                 row_lengths.append(row_capacity)
-            rows.append(row[:row_capacity])
-            mask_rows.append(mask_row[:row_capacity])
 
         # Stopping condition to respect num_iterations, if given
         it += 1
@@ -294,11 +323,13 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
             if consumed >= dataset_size:
                 last_step = True
 
-        # Build tensors
-        use_cuda = device_type == "cuda"
-        batch_tensor = torch.tensor(rows, dtype=torch.long, pin_memory=use_cuda)
-        inputs = batch_tensor[:, :-1].to(device=device, dtype=torch.int32, non_blocking=use_cuda).contiguous()
-        targets = batch_tensor[:, 1:].to(device=device, dtype=torch.int64, non_blocking=use_cuda).contiguous()
+        # Copy the persistent CPU staging buffers to their device-resident companions.
+        cpu_inputs.copy_(row_tokens[:, :-1])
+        cpu_targets.copy_(row_tokens[:, 1:])
+        cpu_mask_targets.copy_(row_masks[:, 1:])
+        inputs.copy_(cpu_inputs, non_blocking=use_cuda)
+        targets.copy_(cpu_targets, non_blocking=use_cuda)
+        mask_targets.copy_(cpu_mask_targets, non_blocking=use_cuda)
 
         # Apply the loss mask from render_conversation_with_think.
         # mask=0: not trained (user prompts, BOS, special tokens)
@@ -307,13 +338,13 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
         # Targets for mask=0 positions set to -1 (ignore_index for cross-entropy).
         # Targets for mask=1 and mask=2 keep their actual token values; thinking-token
         # weighting is applied in the training loop via the returned think_mask.
-        mask_tensor = torch.tensor(mask_rows, dtype=torch.int8)
-        mask_targets = mask_tensor[:, 1:].to(device=device)
         targets[mask_targets == 0] = -1
 
         # Mask out padding positions in targets (set to -1 = ignore_index)
         for i, content_len in enumerate(row_lengths):
-            if content_len < row_capacity:
+            if content_len <= 0:
+                targets[i].fill_(-1)
+            elif content_len < row_capacity:
                 targets[i, content_len-1:] = -1
 
         if split == "val":
@@ -466,14 +497,14 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+    dataloader_time = 0.0
     think_w = get_think_weight(progress)
     for micro_step in range(grad_accum_steps):
         # Phased thinking-block loss:
         #   think_w == 0 → mask out thinking tokens, standard CE loss
         #   think_w == 1 → train all tokens equally, standard CE loss (fast path)
         #   0 < think_w < 1 → per-token weighted loss (slightly slower)
-        any_think = think_mask.any().item()
-        if not any_think or think_w == 1.0:
+        if think_w == 1.0:
             loss = model(x, y)
         elif think_w == 0.0:
             y_no_think = y.clone()
@@ -491,11 +522,14 @@ while True:
             scaler.scale(loss).backward()
         else:
             loss.backward()
+        t_load0 = time.time()
         x, y, think_mask = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        dataloader_time += time.time() - t_load0
         progress = max(progress, approx_progress) # only increase progress monotonically
     # step the optimizer
     lrm = get_lr_multiplier(progress)
     muon_momentum = get_muon_momentum(step)
+    t_opt0 = time.time()
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
         if group['kind'] == 'muon':
@@ -513,6 +547,8 @@ while True:
     synchronize()
     t1 = time.time()
     dt = t1 - t0
+    optim_time = t1 - t_opt0
+    fwdbwd_time = max(0.0, dt - dataloader_time - optim_time)
     # -------------------------------------------------------------------------
 
     # State
@@ -536,8 +572,12 @@ while True:
             "train/loss": debiased_smooth_loss,
             "train/lrm": lrm,
             "train/dt": dt,
+            "train/fwdbwd_dt": fwdbwd_time,
+            "train/dataloader_dt": dataloader_time,
+            "train/optim_dt": optim_time,
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
+            "train/gpu_peak_flops_bf16": gpu_peak_flops if device_type == "cuda" else None,
             "train/epoch": current_epoch,
             "train/think_weight": think_w,
         })
@@ -566,6 +606,8 @@ get_report().log(section="SFT", data=[
     },
     { # stats about training outcomes
         "Minimum validation bpb": min_val_bpb,
+        "GPU": gpu_device_name,
+        "Peak FLOPS (BF16 / GPU)": f"{gpu_peak_flops:.2e}" if device_type == "cuda" else None,
     }
 ])
 

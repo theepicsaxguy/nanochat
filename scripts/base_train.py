@@ -32,7 +32,7 @@ from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint, patch_model_data_for_config
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
-from nanochat.flash_attention import HAS_FA3
+from nanochat.flash_attention import HAS_FA3, FA3_KERNEL_REPO, FA3_UNAVAILABLE_REASON, FA3_BUILD_VARIANT, FA3_MODULE_FILE
 from scripts.base_eval import evaluate_core
 print_banner()
 
@@ -103,9 +103,14 @@ if device_type == "cuda":
     gpu_device_name = torch.cuda.get_device_name(0)
     gpu_peak_flops = get_peak_flops(gpu_device_name)
     print0(f"GPU: {gpu_device_name} | Peak FLOPS (BF16): {gpu_peak_flops:.2e}")
+    print0(f"MFU basis: using {gpu_peak_flops:.2e} BF16 FLOPS per GPU across {ddp_world_size} rank(s)")
 else:
     gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
+    gpu_device_name = str(device)
 print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
+user_config["gpu_name"] = gpu_device_name
+if device_type == "cuda":
+    user_config["gpu_peak_flops_bf16"] = gpu_peak_flops
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
@@ -115,17 +120,28 @@ wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", 
 from nanochat.flash_attention import USE_FA3
 using_fa3 = USE_FA3
 if using_fa3:
-    print0("✓ Using Flash Attention 3 (Hopper GPU detected), efficient, new and awesome.")
+    print0(f"✓ Using Flash Attention 3 via {FA3_KERNEL_REPO}")
+    if FA3_BUILD_VARIANT is not None:
+        print0(f"✓ FA3 build variant: {FA3_BUILD_VARIANT}")
+    if FA3_MODULE_FILE is not None:
+        print0(f"✓ FA3 module: {FA3_MODULE_FILE}")
 else:
     print0("!" * 80)
     if HAS_FA3 and COMPUTE_DTYPE != torch.bfloat16:
         print0(f"WARNING: Flash Attention 3 only supports bf16, but COMPUTE_DTYPE={COMPUTE_DTYPE}. Using PyTorch SDPA fallback")
+        print0(f"WARNING: FA3 kernel repo is available on this machine via {FA3_KERNEL_REPO}")
     else:
         print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback")
+        if FA3_KERNEL_REPO is not None and FA3_UNAVAILABLE_REASON is not None:
+            print0(f"WARNING: FA3 repo '{FA3_KERNEL_REPO}' failed runtime probe: {FA3_UNAVAILABLE_REASON}")
+        if FA3_BUILD_VARIANT is not None:
+            print0(f"WARNING: Attempted FA3 build variant: {FA3_BUILD_VARIANT}")
+        if FA3_MODULE_FILE is not None:
+            print0(f"WARNING: Attempted FA3 module: {FA3_MODULE_FILE}")
     print0("WARNING: Training will be less efficient without FA3")
     if args.window_pattern != "L":
-        print0(f"WARNING: SDPA has no support for sliding window attention (window_pattern='{args.window_pattern}'). Your GPU utilization will be terrible.")
-        print0("WARNING: Recommend using --window-pattern L for full context attention without alternating sliding window patterns.")
+        print0(f"WARNING: Sliding-window attention with SDPA fallback may be much slower on this hardware (window_pattern='{args.window_pattern}').")
+        print0("WARNING: Validate step time carefully before trusting window-pattern ablations on the SDPA path.")
     print0("!" * 80)
 
 # -----------------------------------------------------------------------------
@@ -680,6 +696,8 @@ while True:
             "train/mfu": mfu,
             "train/epoch": epoch,
         }
+        if device_type == "cuda":
+            log_data["train/gpu_peak_flops_bf16"] = gpu_peak_flops
         wandb_run.log(log_data)
 
     # state update
@@ -713,6 +731,8 @@ get_report().log(section="Base model training", data=[
         "Number of training tokens": total_tokens,
         "Tokens : Scaling params ratio": total_batch_size * num_iterations / num_scaling_params,
         "DDP world size": ddp_world_size,
+        "GPU": gpu_device_name,
+        "Peak FLOPS (BF16 / GPU)": f"{gpu_peak_flops:.2e}" if device_type == "cuda" else None,
         "warmup_steps": args.warmup_steps,
         "warmdown_ratio": args.warmdown_ratio,
         "final_lr_frac": args.final_lr_frac,

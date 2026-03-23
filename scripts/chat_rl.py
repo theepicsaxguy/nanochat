@@ -22,7 +22,7 @@ import itertools
 import wandb
 import torch
 import torch.distributed as dist
-from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb, autodetect_device_type
+from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb, autodetect_device_type, get_peak_flops
 from nanochat.checkpoint_manager import save_checkpoint, load_model
 from nanochat.engine import Engine
 from tasks.gsm8k import GSM8K
@@ -65,6 +65,17 @@ user_config = vars(args).copy()
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+if device_type == "cuda":
+    gpu_device_name = torch.cuda.get_device_name(0)
+    gpu_peak_flops = get_peak_flops(gpu_device_name)
+    print0(f"GPU: {gpu_device_name} | Peak FLOPS (BF16): {gpu_peak_flops:.2e}")
+    print0(f"MFU basis: using {gpu_peak_flops:.2e} BF16 FLOPS per GPU across {ddp_world_size} rank(s)")
+else:
+    gpu_peak_flops = float("inf")
+    gpu_device_name = str(device)
+user_config["gpu_name"] = gpu_device_name
+if device_type == "cuda":
+    user_config["gpu_peak_flops_bf16"] = gpu_peak_flops
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
@@ -326,6 +337,10 @@ for step in range(num_steps):
 from nanochat.report import get_report
 get_report().log(section="Chat RL", data=[
     user_config, # CLI args
+    {
+        "GPU": gpu_device_name,
+        "Peak FLOPS (BF16 / GPU)": f"{gpu_peak_flops:.2e}" if device_type == "cuda" else None,
+    },
 ])
 
 wandb_run.finish() # wandb run finish
