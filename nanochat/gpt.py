@@ -456,8 +456,11 @@ class GPT(nn.Module):
             matrix_params = (list(self.transformer.prelude.parameters()) +
                              list(self.transformer.core.parameters()) +
                              list(self.transformer.coda.parameters()) +
-                             list(self.recurrent_adapter.parameters()) +
-                             list(self.recurrent_gate_heads.parameters()))
+                             list(self.recurrent_adapter.parameters()))
+            # Only include gate heads when adaptive recurrence is enabled — without it
+            # they never receive gradients and Muon would crash on None gradient.
+            if self.config.adaptive_recurrence:
+                matrix_params = matrix_params + list(self.recurrent_gate_heads.parameters())
         else:
             matrix_params = list(self.transformer.h.parameters())
 
@@ -467,9 +470,13 @@ class GPT(nn.Module):
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         mix_params = [self.layer_mix]
+        # Gate heads: use Muon when adaptive_recurrence is enabled (they get gradients),
+        # otherwise park them in AdamW scalar group — AdamW skips None-gradient params.
+        gate_head_params = list(self.recurrent_gate_heads.parameters()) if self.use_recurrence and not self.config.adaptive_recurrence else []
 
         all_param_count = (len(matrix_params) + len(embedding_params) + len(lm_head_params) +
-                           len(value_embeds_params) + len(resid_params) + len(x0_params) + len(mix_params))
+                           len(value_embeds_params) + len(resid_params) + len(x0_params) + len(mix_params) +
+                           len(gate_head_params))
         assert len(list(self.parameters())) == all_param_count
 
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -482,6 +489,8 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.9, 0.98), eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=mix_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
+            # Gate heads parked in AdamW when not actively trained (AdamW skips None-grad params)
+            *([dict(kind='adamw', params=gate_head_params, lr=scalar_lr, betas=(0.9, 0.98), eps=1e-10, weight_decay=0.0)] if gate_head_params else []),
         ]
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
