@@ -22,9 +22,10 @@ import itertools
 import wandb
 import torch
 import torch.distributed as dist
-from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb, autodetect_device_type, get_peak_flops
+from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON
 from nanochat.checkpoint_manager import save_checkpoint, load_model
 from nanochat.engine import Engine
+from nanochat.flash_attention import describe_attention_backends
 from tasks.gsm8k import GSM8K
 
 # -----------------------------------------------------------------------------
@@ -68,6 +69,7 @@ user_config = vars(args).copy()
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 if device_type == "cuda":
     gpu_device_name = torch.cuda.get_device_name(0)
     gpu_peak_flops = get_peak_flops(gpu_device_name)
@@ -83,6 +85,10 @@ if device_type == "cuda":
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-rl", name=args.run, config=user_config)
+
+# Attention backend status
+for line in describe_attention_backends():
+    print0(line)
 
 # Init model and tokenizer
 model, tokenizer, meta = load_model("sft", device, phase="eval", model_tag=args.model_tag, step=args.model_step)

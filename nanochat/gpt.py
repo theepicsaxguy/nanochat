@@ -431,7 +431,8 @@ class GPT(nn.Module):
             transformer_matrices = (sum(p.numel() for p in self.transformer.prelude.parameters()) +
                                     sum(p.numel() for p in self.transformer.core.parameters()) +
                                     sum(p.numel() for p in self.transformer.coda.parameters()) +
-                                    sum(p.numel() for p in self.recurrent_adapter.parameters()))
+                                    sum(p.numel() for p in self.recurrent_adapter.parameters()) +
+                                    sum(p.numel() for p in self.recurrent_gate_heads.parameters()))
         else:
             transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
 
@@ -455,7 +456,8 @@ class GPT(nn.Module):
             matrix_params = (list(self.transformer.prelude.parameters()) +
                              list(self.transformer.core.parameters()) +
                              list(self.transformer.coda.parameters()) +
-                             list(self.recurrent_adapter.parameters()))
+                             list(self.recurrent_adapter.parameters()) +
+                             list(self.recurrent_gate_heads.parameters()))
         else:
             matrix_params = list(self.transformer.h.parameters())
 

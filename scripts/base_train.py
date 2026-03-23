@@ -32,7 +32,7 @@ from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint, patch_model_data_for_config
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
-from nanochat.flash_attention import HAS_FA3, FA3_KERNEL_REPO, FA3_UNAVAILABLE_REASON, FA3_BUILD_VARIANT, FA3_MODULE_FILE
+from nanochat.flash_attention import describe_attention_backends
 from scripts.base_eval import evaluate_core
 print_banner()
 
@@ -131,33 +131,9 @@ if device_type == "cuda":
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
 
-# Flash Attention status
-from nanochat.flash_attention import USE_FA3
-using_fa3 = USE_FA3
-if using_fa3:
-    print0(f"✓ Using Flash Attention 3 via {FA3_KERNEL_REPO}")
-    if FA3_BUILD_VARIANT is not None:
-        print0(f"✓ FA3 build variant: {FA3_BUILD_VARIANT}")
-    if FA3_MODULE_FILE is not None:
-        print0(f"✓ FA3 module: {FA3_MODULE_FILE}")
-else:
-    print0("!" * 80)
-    if HAS_FA3 and COMPUTE_DTYPE != torch.bfloat16:
-        print0(f"WARNING: Flash Attention 3 only supports bf16, but COMPUTE_DTYPE={COMPUTE_DTYPE}. Using PyTorch SDPA fallback")
-        print0(f"WARNING: FA3 kernel repo is available on this machine via {FA3_KERNEL_REPO}")
-    else:
-        print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback")
-        if FA3_KERNEL_REPO is not None and FA3_UNAVAILABLE_REASON is not None:
-            print0(f"WARNING: FA3 repo '{FA3_KERNEL_REPO}' failed runtime probe: {FA3_UNAVAILABLE_REASON}")
-        if FA3_BUILD_VARIANT is not None:
-            print0(f"WARNING: Attempted FA3 build variant: {FA3_BUILD_VARIANT}")
-        if FA3_MODULE_FILE is not None:
-            print0(f"WARNING: Attempted FA3 module: {FA3_MODULE_FILE}")
-    print0("WARNING: Training will be less efficient without FA3")
-    if args.window_pattern != "L":
-        print0(f"WARNING: Sliding-window attention with SDPA fallback may be much slower on this hardware (window_pattern='{args.window_pattern}').")
-        print0("WARNING: Validate step time carefully before trusting window-pattern ablations on the SDPA path.")
-    print0("!" * 80)
+# Attention backend status
+for line in describe_attention_backends():
+    print0(line)
 
 # -----------------------------------------------------------------------------
 # Tokenizer will be useful for evaluation and also we need the vocab size to init the model
@@ -227,7 +203,7 @@ if args.time_budget_seconds > 0 and resuming:
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
-    patch_model_data_for_config(model_data, model.config)
+    patch_model_data_for_config(model_data, model.config, reference_state=model.state_dict())
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
 

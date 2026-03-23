@@ -21,7 +21,7 @@ from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state
 from nanochat.loss_eval import evaluate_bpb
 import torch.distributed as dist
-from nanochat.flash_attention import HAS_FA3, USE_FA3, FA3_KERNEL_REPO, FA3_UNAVAILABLE_REASON, FA3_BUILD_VARIANT, FA3_MODULE_FILE
+from nanochat.flash_attention import describe_attention_backends
 from nanochat.engine import Engine
 from scripts.chat_eval import run_chat_eval
 
@@ -101,23 +101,9 @@ if device_type == "cuda":
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-sft", name=args.run, config=user_config)
 
-# Flash Attention status
-if USE_FA3:
-    print0(f"✓ Using Flash Attention 3 via {FA3_KERNEL_REPO}")
-    if FA3_BUILD_VARIANT is not None:
-        print0(f"✓ FA3 build variant: {FA3_BUILD_VARIANT}")
-    if FA3_MODULE_FILE is not None:
-        print0(f"✓ FA3 module: {FA3_MODULE_FILE}")
-elif HAS_FA3 and COMPUTE_DTYPE != torch.bfloat16:
-    print0(f"WARNING: FA3 is available via {FA3_KERNEL_REPO}, but COMPUTE_DTYPE={COMPUTE_DTYPE}; using SDPA fallback.")
-else:
-    print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback. Training will be less efficient.")
-    if FA3_KERNEL_REPO is not None and FA3_UNAVAILABLE_REASON is not None:
-        print0(f"WARNING: FA3 repo '{FA3_KERNEL_REPO}' failed runtime probe: {FA3_UNAVAILABLE_REASON}")
-    if FA3_BUILD_VARIANT is not None:
-        print0(f"WARNING: Attempted FA3 build variant: {FA3_BUILD_VARIANT}")
-    if FA3_MODULE_FILE is not None:
-        print0(f"WARNING: Attempted FA3 module: {FA3_MODULE_FILE}")
+# Attention backend status
+for line in describe_attention_backends():
+    print0(line)
 
 # Load the model and tokenizer
 model, tokenizer, meta = load_model("base", device, phase="train", model_tag=args.model_tag, step=args.model_step)
@@ -169,11 +155,18 @@ if args.load_optimizer:
     optimizer_data = load_optimizer_state("base", device, rank=ddp_rank, model_tag=args.model_tag, step=args.model_step)
     if optimizer_data is not None:
         base_lrs = [group["lr"] for group in optimizer.param_groups]
-        optimizer.load_state_dict(optimizer_data)
-        del optimizer_data
-        for group, base_lr in zip(optimizer.param_groups, base_lrs):
-            group["lr"] = base_lr
-        print0("Loaded optimizer state from pretrained checkpoint (momentum buffers only, LRs reset)")
+        try:
+            optimizer.load_state_dict(optimizer_data)
+            for group, base_lr in zip(optimizer.param_groups, base_lrs):
+                group["lr"] = base_lr
+            print0("Loaded optimizer state from pretrained checkpoint (momentum buffers only, LRs reset)")
+        except ValueError as exc:
+            print0(
+                "WARNING: optimizer checkpoint is incompatible with the current parameter groups "
+                f"({exc}). Starting SFT with a fresh optimizer."
+            )
+        finally:
+            del optimizer_data
     else:
         print0("WARNING: optimizer checkpoint not found, starting with fresh optimizer (slightly worse)")
 
