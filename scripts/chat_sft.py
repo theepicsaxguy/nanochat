@@ -394,6 +394,21 @@ def get_muon_momentum(it):
     momentum = (1 - frac) * 0.85 + frac * 0.95
     return momentum
 
+def get_ponder_lambda(progress):
+    cfg = orig_model.config
+    if cfg.ponder_lambda <= 0.0 or progress < cfg.ponder_stage_start:
+        return 0.0
+    if progress >= cfg.ponder_warmup_end:
+        return cfg.ponder_lambda
+    span = max(cfg.ponder_warmup_end - cfg.ponder_stage_start, 1e-8)
+    return cfg.ponder_lambda * ((progress - cfg.ponder_stage_start) / span)
+
+def get_acttail_weight(progress):
+    cfg = orig_model.config
+    if cfg.acttail_weight <= 0.0 or progress < cfg.acttail_start_frac:
+        return 0.0
+    return cfg.acttail_weight
+
 # -----------------------------------------------------------------------------
 # Training loop
 x, y, think_mask = next(train_loader) # prefetch the very first batch of data
@@ -475,15 +490,7 @@ while True:
             {
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step
-                "model_config": {
-                    "sequence_len": args.max_seq_len,
-                    "vocab_size": tokenizer.get_vocab_size(),
-                    "n_layer": depth,
-                    "n_head": model.config.n_head,
-                    "n_kv_head": model.config.n_kv_head,
-                    "n_embd": model.config.n_embd,
-                    "window_pattern": model.config.window_pattern,
-                },
+                "model_config": dict(orig_model.config.__dict__),
                 "user_config": user_config, # inputs to the training script
             },
             rank=ddp_rank,
@@ -499,24 +506,50 @@ while True:
     t0 = time.time()
     dataloader_time = 0.0
     think_w = get_think_weight(progress)
+    ponder_lambda = get_ponder_lambda(progress)
+    acttail_weight = get_acttail_weight(progress)
+    train_step_info = {}
     for micro_step in range(grad_accum_steps):
         # Phased thinking-block loss:
         #   think_w == 0 → mask out thinking tokens, standard CE loss
         #   think_w == 1 → train all tokens equally, standard CE loss (fast path)
         #   0 < think_w < 1 → per-token weighted loss (slightly slower)
         if think_w == 1.0:
-            loss = model(x, y)
+            loss, info = model(
+                x, y,
+                ponder_lambda_override=ponder_lambda,
+                acttail_weight_override=acttail_weight,
+                prores_progress_override=progress,
+                return_info=True,
+            )
         elif think_w == 0.0:
             y_no_think = y.clone()
             y_no_think[think_mask] = -1
-            loss = model(x, y_no_think)
+            loss, info = model(
+                x, y_no_think,
+                ponder_lambda_override=ponder_lambda,
+                acttail_weight_override=acttail_weight,
+                prores_progress_override=progress,
+                return_info=True,
+            )
         else:
-            per_token_loss = model(x, y, loss_reduction='none').view(y.shape)  # (B, T)
+            per_token_loss, info = model(
+                x, y,
+                loss_reduction='none',
+                ponder_lambda_override=ponder_lambda,
+                acttail_weight_override=acttail_weight,
+                prores_progress_override=progress,
+                return_info=True,
+            )
+            per_token_loss = per_token_loss.view(y.shape)  # (B, T)
             valid = (y >= 0).float()
             w = torch.where(think_mask, think_w, 1.0) * valid
             denom = w.sum().clamp_min(1.0)
             loss = (per_token_loss * w).sum() / denom
         train_loss = loss.detach() # for logging
+        for key, value in info.items():
+            if torch.is_tensor(value):
+                train_step_info[key] = train_step_info.get(key, 0.0) + float(value.detach().float().item())
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -553,6 +586,7 @@ while True:
 
     # State
     step += 1
+    train_step_info = {k: v / grad_accum_steps for k, v in train_step_info.items()}
 
     # logging
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss.item() # EMA the training loss
@@ -563,9 +597,11 @@ while True:
     mfu = 100 * flops_per_sec / (gpu_peak_flops * ddp_world_size)
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
-    print0(f"step {step:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | epoch: {current_epoch} | total time: {total_training_time/60:.2f}m")
+    avg_depth = train_step_info.get("avg_recurrence_depth", float(orig_model.config.train_recurrence if orig_model.config.n_recurrent > 0 else 1))
+    halted_frac = train_step_info.get("recurrent_halted_fraction", 0.0)
+    print0(f"step {step:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | depth: {avg_depth:.2f} | halted: {halted_frac:.2f} | epoch: {current_epoch} | total time: {total_training_time/60:.2f}m")
     if step % 10 == 0:
-        wandb_run.log({
+        log_data = {
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
@@ -580,7 +616,24 @@ while True:
             "train/gpu_peak_flops_bf16": gpu_peak_flops if device_type == "cuda" else None,
             "train/epoch": current_epoch,
             "train/think_weight": think_w,
-        })
+        }
+        for key in [
+            "avg_recurrence_depth",
+            "configured_recurrence_depth",
+            "recurrent_halted_fraction",
+            "recurrent_active_fraction",
+            "ponder_gate_mean",
+            "ponder_loss",
+            "ponder_lambda",
+            "acttail_loss",
+            "acttail_active_fraction",
+            "acttail_threshold",
+            "adaptive_exit_kl",
+            "prores_scale_mean",
+        ]:
+            if key in train_step_info:
+                log_data[f"train/{key}"] = train_step_info[key]
+        wandb_run.log(log_data)
 
     # The garbage collector spends ~500ms scanning for cycles quite frequently.
     # We manually manage it to avoid these pauses during training.

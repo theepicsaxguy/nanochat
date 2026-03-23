@@ -12,7 +12,6 @@ At inference time: r can be 1,4,8,16,32 — no extra VRAM cost
 Truncated backprop: only last k=config.k_backprop iterations receive gradients
 """
 
-from functools import partial
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -51,6 +50,21 @@ class GPTConfig:
     n_coda: int = 0          # layers after the shared recurrent core
     train_recurrence: int = 4  # fixed iterations during training (torch.compile-friendly)
     k_backprop: int = 4        # last N iterations receive gradients (truncated backprop)
+    adaptive_recurrence: bool = False
+    adaptive_recurrence_eval_only: bool = True
+    ponder_stage_start: float = 0.0
+    ponder_warmup_end: float = 0.0
+    ponder_lambda: float = 0.0
+    ponder_target_frac: float = 0.1
+    acttail_weight: float = 0.0
+    acttail_target: float = 0.8
+    acttail_start_frac: float = 0.0
+    acttail_scope: str = "recurrent_ffn_only"
+    prores_enable: bool = False
+    prores_warmup_frac: float = 0.05
+    prores_mode: str = "linear"
+    eval_adaptive_exit_threshold: float = 0.0
+    eval_max_recurrence: int = 0
     # -------------------------------------------------------------------------
     # Sparse MoE (kept for backward compat with old checkpoints, not active by default)
     moe_num_experts: int = 1
@@ -137,9 +151,6 @@ class CausalSelfAttention(nn.Module):
                 causal=True,
                 window_size=window_size,
             )
-            # Advance position after last layer processes
-            if self.layer_idx == kv_cache.n_layers - 1:
-                kv_cache.advance(T)
 
         # Re-assemble the heads and project back to residual stream
         y = y.contiguous().view(B, T, -1)
@@ -155,9 +166,12 @@ class MLP(nn.Module):
         self.c_fc = Linear(config.n_embd, intermediate, bias=False)
         self.c_proj = Linear(intermediate, config.n_embd, bias=False)
 
-    def forward(self, x):
+    def forward(self, x, return_hidden=False):
         h = F.silu(self.c_gate(x)) * self.c_fc(x)
-        return self.c_proj(h)
+        y = self.c_proj(h)
+        if return_hidden:
+            return y, h
+        return y
 
 
 class Block(nn.Module):
@@ -166,8 +180,12 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx, ve_enabled=ve_enabled)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, return_mlp_hidden=False):
         x = x + norm(self.attn(norm(x), ve, cos_sin, window_size, kv_cache))
+        if return_mlp_hidden:
+            mlp_out, mlp_hidden = self.mlp(norm(x), return_hidden=True)
+            x = x + norm(mlp_out)
+            return x, mlp_hidden
         x = x + norm(self.mlp(norm(x)))
         return x
 
@@ -225,6 +243,15 @@ class GPT(nn.Module):
             })
             # Adapter: re-injects initial context at each recurrent iteration
             self.recurrent_adapter = RecurrentAdapter(config.n_embd)
+            gate_hidden = max(config.n_embd // 4, 32)
+            self.recurrent_gate_heads = nn.ModuleList([
+                nn.Sequential(
+                    Linear(config.n_embd, gate_hidden, bias=False),
+                    nn.SiLU(),
+                    Linear(gate_hidden, 1, bias=False),
+                )
+                for _ in range(max(config.train_recurrence - 1, 0))
+            ])
             # Per-layer scalars for prelude + core + coda (n_layer total)
             self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
             self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
@@ -297,6 +324,10 @@ class GPT(nn.Module):
                 init_block(block)
             # Adapter: small init so first iteration starts close to identity
             torch.nn.init.normal_(self.recurrent_adapter.proj.weight, mean=0.0, std=0.02)
+            for gate in self.recurrent_gate_heads:
+                for module in gate:
+                    if isinstance(module, Linear):
+                        torch.nn.init.zeros_(module.weight)
             self.layer_mix.fill_(-10.0)
             self.layer_mix.data[-1] = 0.0  # weight final output
         else:
@@ -463,13 +494,125 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def _run_block(self, block, x, idx, layer_idx, cos_sin, kv_cache):
+    def _run_block(self, block, x, idx, layer_idx, cos_sin, kv_cache, return_mlp_hidden=False):
         """Run a single block, injecting value embeddings if available."""
         ve = self.value_embeds[str(layer_idx)](idx).to(x.dtype) if str(layer_idx) in self.value_embeds else None
-        return block(x, ve, cos_sin, self.window_sizes[min(layer_idx, len(self.window_sizes)-1)], kv_cache)
+        return block(
+            x, ve, cos_sin, self.window_sizes[min(layer_idx, len(self.window_sizes)-1)], kv_cache,
+            return_mlp_hidden=return_mlp_hidden,
+        )
+
+    def _resolve_ponder_lambda(self, progress, ponder_lambda_override):
+        if ponder_lambda_override is not None:
+            return ponder_lambda_override
+        if self.config.ponder_lambda <= 0.0 or progress is None:
+            return self.config.ponder_lambda
+        if progress < self.config.ponder_stage_start:
+            return 0.0
+        if progress >= self.config.ponder_warmup_end:
+            return self.config.ponder_lambda
+        span = max(self.config.ponder_warmup_end - self.config.ponder_stage_start, 1e-8)
+        frac = (progress - self.config.ponder_stage_start) / span
+        return self.config.ponder_lambda * frac
+
+    def _resolve_acttail_weight(self, progress, acttail_weight_override):
+        if acttail_weight_override is not None:
+            return acttail_weight_override
+        if progress is None or self.config.acttail_weight <= 0.0:
+            return self.config.acttail_weight
+        if progress < self.config.acttail_start_frac:
+            return 0.0
+        return self.config.acttail_weight
+
+    def _get_prores_scales(self, progress, prores_progress_override):
+        if not self.config.prores_enable or self.config.prores_warmup_frac <= 0.0:
+            return None
+        if prores_progress_override is not None:
+            progress = prores_progress_override
+        if progress is None:
+            return None
+        if progress >= self.config.prores_warmup_frac:
+            return None
+        target_layers = list(range(self.config.n_prelude, self.config.n_prelude + self.config.n_recurrent))
+        if not target_layers:
+            return None
+        warm = max(progress / self.config.prores_warmup_frac, 0.0)
+        scales = torch.ones(self.config.n_layer, device=self.resid_lambdas.device, dtype=self.resid_lambdas.dtype)
+        n_target = len(target_layers)
+        positions = torch.arange(n_target, device=scales.device, dtype=scales.dtype)
+        if self.config.prores_mode == "linear":
+            target_scales = (warm * n_target - positions).clamp_(0.0, 1.0)
+        else:
+            target_scales = torch.full((n_target,), warm, device=scales.device, dtype=scales.dtype).clamp_(0.0, 1.0)
+        scales[target_layers] = target_scales
+        return scales
+
+    def _apply_residual_mix(self, x, x0, layer_idx, prores_scales):
+        resid_scale = self.resid_lambdas[layer_idx]
+        if prores_scales is not None:
+            resid_scale = resid_scale * prores_scales[layer_idx]
+        return resid_scale * x + self.x0_lambdas[layer_idx] * x0
+
+    def _bottomk_mask_update(self, gate_scores, active_mask):
+        prune_frac = float(self.config.ponder_target_frac)
+        if prune_frac <= 0.0:
+            return active_mask, active_mask.float().mean(dim=1)
+        B, T = gate_scores.shape
+        prune_k = min(T, max(1, int(round(prune_frac * T))))
+        masked_scores = torch.where(active_mask, gate_scores, torch.full_like(gate_scores, float("inf")))
+        prune_idx = torch.topk(masked_scores, k=prune_k, dim=-1, largest=False).indices
+        active_counts = active_mask.sum(dim=-1)
+        allowed_prune = torch.clamp(active_counts - 1, min=0, max=prune_k)
+        prune_selector = torch.arange(prune_k, device=gate_scores.device).unsqueeze(0) < allowed_prune.unsqueeze(1)
+        prune_mask = torch.zeros_like(active_mask)
+        prune_mask.scatter_(1, prune_idx, prune_selector)
+        next_active = active_mask & (~prune_mask)
+        return next_active, next_active.float().mean(dim=1)
+
+    def _acttail_loss(self, activations):
+        if not activations:
+            zero = self.lm_head.weight.new_zeros(())
+            return zero, zero, zero
+        target_sparsity = float(self.config.acttail_target)
+        keep_frac = min(max(1.0 - target_sparsity, 1e-3), 1.0)
+        chunks = [a.reshape(-1, a.size(-1)) for a in activations]
+        flat = torch.cat(chunks, dim=0)
+        abs_flat = flat.abs()
+        k_keep = min(abs_flat.size(-1), max(1, int(round(keep_frac * abs_flat.size(-1)))))
+        if k_keep >= abs_flat.size(-1):
+            tail_penalty = abs_flat.new_zeros(())
+            active_frac = abs_flat.new_ones(())
+            threshold = abs_flat.new_zeros(())
+        else:
+            topk_vals = torch.topk(abs_flat, k=k_keep, dim=-1, largest=True).values
+            threshold = topk_vals[..., -1:]
+            keep_mask = abs_flat >= threshold
+            tail_penalty = torch.where(keep_mask, torch.zeros_like(abs_flat), abs_flat).mean()
+            active_frac = keep_mask.float().mean()
+            threshold = threshold.mean()
+        return tail_penalty, active_frac, threshold
+
+    def _compute_adaptive_exit_logits(self, x, idx, x0, cos_sin, kv_cache, prores_scales):
+        dfa_hidden = []
+        n_coda_start = self.config.n_prelude + self.config.n_recurrent
+        y = x
+        for i, block in enumerate(self.transformer.coda):
+            layer_abs = n_coda_start + i
+            y = self._apply_residual_mix(y, x0, layer_abs, prores_scales)
+            y = self._run_block(block, y, idx, layer_abs, cos_sin, kv_cache)
+        y = norm(y)
+        logits = self.lm_head(y)
+        logits = logits[..., :self.config.vocab_size]
+        logits = logits.float()
+        softcap = 15
+        logits = softcap * torch.tanh(logits / softcap)
+        return y, logits, dfa_hidden
 
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', progress=None,
-                recurrence: Optional[int] = None, dfa_weight_override: Optional[float] = None):
+                recurrence: Optional[int] = None, dfa_weight_override: Optional[float] = None,
+                adaptive_exit_threshold: Optional[float] = None, max_recurrence: Optional[int] = None,
+                ponder_lambda_override: Optional[float] = None, acttail_weight_override: Optional[float] = None,
+                prores_progress_override: Optional[float] = None, return_info: bool = False):
         """
         Forward pass.
 
@@ -490,21 +633,35 @@ class GPT(nn.Module):
         x = x.to(COMPUTE_DTYPE)
         x = norm(x)
         x0 = x  # save initial normalized embedding for x0 residual
+        info = {}
+        prores_scales = self._get_prores_scales(progress, prores_progress_override)
 
         if self.use_recurrence:
             # -------------------------------------------------------
             # RECURRENT DEPTH FORWARD PASS
             # Architecture: prelude → [adapter + core] × r → coda
             # -------------------------------------------------------
+            configured_eval_max = self.config.eval_max_recurrence if self.config.eval_max_recurrence > 0 else None
+            if max_recurrence is None:
+                max_recurrence = configured_eval_max
             r = recurrence if recurrence is not None else self.config.train_recurrence
+            if max_recurrence is not None:
+                r = min(r, max_recurrence)
             k_bp = min(r, self.config.k_backprop)  # backprop through last k_bp iterations
+            adaptive_training = self.config.adaptive_recurrence and (self.training or not self.config.adaptive_recurrence_eval_only)
+            ponder_lambda = self._resolve_ponder_lambda(progress, ponder_lambda_override) if adaptive_training else 0.0
+            acttail_weight = self._resolve_acttail_weight(progress, acttail_weight_override)
+            if adaptive_exit_threshold is None and not self.training and self.config.eval_adaptive_exit_threshold > 0:
+                adaptive_exit_threshold = self.config.eval_adaptive_exit_threshold
+            enable_adaptive_exit = (adaptive_exit_threshold is not None and adaptive_exit_threshold > 0 and not self.training)
+            adaptive_exit_threshold = float(adaptive_exit_threshold) if adaptive_exit_threshold is not None else None
 
             # Prelude: standard transformer layers (with x0 injection)
             mix_weights = F.softmax(self.layer_mix, dim=0)
             x_avg = mix_weights[0] * x
             dfa_hidden = []
             for i, block in enumerate(self.transformer.prelude):
-                x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+                x = self._apply_residual_mix(x, x0, i, prores_scales)
                 x = self._run_block(block, x, idx, i, cos_sin, kv_cache)
                 if targets is not None and i in self.config.dfa_layers:
                     dfa_hidden.append((i, x))
@@ -513,16 +670,54 @@ class GPT(nn.Module):
 
             # Recurrent core: shared block run r times
             n_pre = self.config.n_prelude
+            active_mask = torch.ones(B, T, dtype=torch.bool, device=idx.device)
+            recurrent_active_fracs = []
+            recurrent_gate_means = []
+            acttail_activations = []
+            ponder_terms = []
+            prev_exit_log_probs = None
+            exit_kl = None
+            recurrence_steps_used = 0
             for iteration in range(r):
+                prev_x = x
                 # Re-inject initial context via adapter (brain's "sensory re-entry")
                 x = self.recurrent_adapter(x, initial_state)
                 # Apply per-layer scalars for core (uses lambda indices n_pre..n_pre+n_recurrent)
                 for j, block in enumerate(self.transformer.core):
                     layer_abs = n_pre + j
-                    x = self.resid_lambdas[layer_abs] * x + self.x0_lambdas[layer_abs] * x0
-                    x = self._run_block(block, x, idx, layer_abs, cos_sin, kv_cache)
+                    x = self._apply_residual_mix(x, x0, layer_abs, prores_scales)
+                    want_hidden = acttail_weight > 0.0 and self.config.acttail_scope == "recurrent_ffn_only"
+                    block_out = self._run_block(block, x, idx, layer_abs, cos_sin, kv_cache, return_mlp_hidden=want_hidden)
+                    if want_hidden:
+                        x, mlp_hidden = block_out
+                        acttail_activations.append(mlp_hidden)
+                    else:
+                        x = block_out
                     if targets is not None and layer_abs in self.config.dfa_layers:
                         dfa_hidden.append((layer_abs, x))
+                    if adaptive_training:
+                        x = torch.where(active_mask.unsqueeze(-1), x, prev_x)
+                recurrence_steps_used = iteration + 1
+                recurrent_active_fracs.append(active_mask.float().mean())
+
+                if adaptive_training and iteration < r - 1 and len(self.recurrent_gate_heads) > 0:
+                    gate_head = self.recurrent_gate_heads[min(iteration, len(self.recurrent_gate_heads) - 1)]
+                    gate_scores = gate_head(norm(x)).squeeze(-1)
+                    recurrent_gate_means.append(torch.sigmoid(gate_scores).mean())
+                    ponder_terms.append(torch.sigmoid(gate_scores[active_mask]).mean() if active_mask.any() else gate_scores.new_zeros(()))
+                    active_mask, next_active_frac = self._bottomk_mask_update(gate_scores, active_mask)
+                    recurrent_active_fracs.append(next_active_frac.mean())
+
+                if enable_adaptive_exit and iteration < r - 1:
+                    _, provisional_logits, _ = self._compute_adaptive_exit_logits(x, idx, x0, cos_sin, kv_cache, prores_scales)
+                    curr_log_probs = F.log_softmax(provisional_logits, dim=-1)
+                    if prev_exit_log_probs is not None:
+                        prev_probs = prev_exit_log_probs.exp()
+                        exit_kl = (prev_probs * (prev_exit_log_probs - curr_log_probs)).sum(dim=-1).mean()
+                        if exit_kl.item() <= adaptive_exit_threshold:
+                            prev_exit_log_probs = curr_log_probs
+                            break
+                    prev_exit_log_probs = curr_log_probs
 
                 # Truncated backprop: detach the running state for early iterations.
                 # initial_state (prelude output) is intentionally NOT detached —
@@ -532,15 +727,35 @@ class GPT(nn.Module):
 
             # Coda: standard transformer layers
             n_coda_start = n_pre + self.config.n_recurrent
-            for i, block in enumerate(self.transformer.coda):
-                layer_abs = n_coda_start + i
-                x = self.resid_lambdas[layer_abs] * x + self.x0_lambdas[layer_abs] * x0
-                x = self._run_block(block, x, idx, layer_abs, cos_sin, kv_cache)
-                if targets is not None and layer_abs in self.config.dfa_layers:
-                    dfa_hidden.append((layer_abs, x))
+            if enable_adaptive_exit and prev_exit_log_probs is not None and recurrence_steps_used < r:
+                for i, block in enumerate(self.transformer.coda):
+                    layer_abs = n_coda_start + i
+                    x = self._apply_residual_mix(x, x0, layer_abs, prores_scales)
+                    x = self._run_block(block, x, idx, layer_abs, cos_sin, kv_cache)
+                    if targets is not None and layer_abs in self.config.dfa_layers:
+                        dfa_hidden.append((layer_abs, x))
+            else:
+                for i, block in enumerate(self.transformer.coda):
+                    layer_abs = n_coda_start + i
+                    x = self._apply_residual_mix(x, x0, layer_abs, prores_scales)
+                    x = self._run_block(block, x, idx, layer_abs, cos_sin, kv_cache)
+                    if targets is not None and layer_abs in self.config.dfa_layers:
+                        dfa_hidden.append((layer_abs, x))
 
             x_avg = x_avg + mix_weights[1] * x  # final output
             x = x_avg
+            info.update({
+                "avg_recurrence_depth": x.new_tensor(float(recurrence_steps_used)),
+                "configured_recurrence_depth": x.new_tensor(float(r)),
+                "recurrent_halted_fraction": x.new_tensor(1.0 - (recurrence_steps_used / max(r, 1))),
+                "recurrent_active_fraction": torch.stack(recurrent_active_fracs).mean() if recurrent_active_fracs else x.new_tensor(1.0),
+                "ponder_gate_mean": torch.stack(recurrent_gate_means).mean() if recurrent_gate_means else x.new_zeros(()),
+                "adaptive_exit_kl": exit_kl if exit_kl is not None else x.new_zeros(()),
+            })
+            if prores_scales is not None:
+                info["prores_scale_mean"] = prores_scales[n_pre:n_pre + self.config.n_recurrent].mean()
+            else:
+                info["prores_scale_mean"] = x.new_tensor(1.0)
 
         else:
             # -------------------------------------------------------
@@ -550,13 +765,20 @@ class GPT(nn.Module):
             x_avg = mix_weights[0] * x
             dfa_hidden = []
             for i, block in enumerate(self.transformer.h):
-                x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+                x = self._apply_residual_mix(x, x0, i, prores_scales)
                 ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
                 x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
                 x_avg = x_avg + mix_weights[i + 1] * x
                 if targets is not None and i in self.config.dfa_layers:
                     dfa_hidden.append((i, x))
             x = x_avg
+            info["avg_recurrence_depth"] = x.new_tensor(1.0)
+            info["configured_recurrence_depth"] = x.new_tensor(1.0)
+            info["recurrent_halted_fraction"] = x.new_zeros(())
+            info["recurrent_active_fraction"] = x.new_tensor(1.0)
+            info["ponder_gate_mean"] = x.new_zeros(())
+            info["adaptive_exit_kl"] = x.new_zeros(())
+            info["prores_scale_mean"] = x.new_tensor(1.0)
 
         x = norm(x)
 
@@ -566,6 +788,8 @@ class GPT(nn.Module):
         logits = logits[..., :self.config.vocab_size]
         logits = logits.float()
         logits = softcap * torch.tanh(logits / softcap)
+        if kv_cache is not None:
+            kv_cache.advance(T)
 
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
@@ -602,13 +826,45 @@ class GPT(nn.Module):
                     aux_losses.append(layer_scale * aux.sum() / denom)
                 if aux_losses:
                     loss = loss + effective_dfa_weight * torch.stack(aux_losses).mean()
+            if self.use_recurrence:
+                acttail_weight = self._resolve_acttail_weight(progress, acttail_weight_override)
+                if acttail_weight > 0.0 and 'acttail_activations' in locals():
+                    acttail_loss, acttail_active_frac, acttail_threshold = self._acttail_loss(acttail_activations)
+                    loss = loss + acttail_weight * acttail_loss
+                    info["acttail_loss"] = acttail_loss
+                    info["acttail_active_fraction"] = acttail_active_frac
+                    info["acttail_threshold"] = acttail_threshold
+                else:
+                    info["acttail_loss"] = loss.new_zeros(())
+                    info["acttail_active_fraction"] = loss.new_zeros(())
+                    info["acttail_threshold"] = loss.new_zeros(())
+                if adaptive_training and ponder_lambda > 0.0 and ponder_terms:
+                    ponder_loss = torch.stack(ponder_terms).mean()
+                    loss = loss + ponder_lambda * ponder_loss
+                    info["ponder_loss"] = ponder_loss
+                    info["ponder_lambda"] = loss.new_tensor(ponder_lambda)
+                else:
+                    info["ponder_loss"] = loss.new_zeros(())
+                    info["ponder_lambda"] = loss.new_tensor(float(ponder_lambda))
+            if return_info:
+                info["loss"] = loss.detach()
+                return loss, info
             return loss
         else:
+            if self.use_recurrence:
+                info.setdefault("acttail_loss", logits.new_zeros(()))
+                info.setdefault("acttail_active_fraction", logits.new_zeros(()))
+                info.setdefault("acttail_threshold", logits.new_zeros(()))
+                info.setdefault("ponder_loss", logits.new_zeros(()))
+                info.setdefault("ponder_lambda", logits.new_zeros(()))
+            if return_info:
+                return logits, info
             return logits
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42,
-                 recurrence: Optional[int] = None):
+                 recurrence: Optional[int] = None, adaptive_exit_threshold: Optional[float] = None,
+                 max_recurrence: Optional[int] = None):
         """
         Autoregressive inference. recurrence=None uses train_recurrence;
         pass recurrence=16 or 32 for deeper latent reasoning at inference.
@@ -621,7 +877,11 @@ class GPT(nn.Module):
             rng.manual_seed(seed)
         ids = torch.tensor([tokens], dtype=torch.long, device=device)
         for _ in range(max_tokens):
-            logits = self.forward(ids, recurrence=recurrence)
+            logits = self.forward(
+                ids, recurrence=recurrence,
+                adaptive_exit_threshold=adaptive_exit_threshold,
+                max_recurrence=max_recurrence,
+            )
             logits = logits[:, -1, :]
             if top_k is not None and top_k > 0:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))

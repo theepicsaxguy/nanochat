@@ -58,6 +58,21 @@ parser.add_argument("--n-recurrent", type=int, default=0, help="layers in shared
 parser.add_argument("--n-coda", type=int, default=0, help="coda layers after recurrent core")
 parser.add_argument("--train-recurrence", type=int, default=4, help="fixed recurrence iterations during training")
 parser.add_argument("--k-backprop", type=int, default=4, help="last N iterations receive gradients (truncated backprop)")
+parser.add_argument("--adaptive-recurrence", action="store_true", help="enable learned token-wise halting in recurrent core")
+parser.add_argument("--adaptive-recurrence-eval-only", type=int, default=1, help="keep learned halting disabled during training and only use eval-time adaptive features")
+parser.add_argument("--ponder-stage-start", type=float, default=0.0, help="training progress fraction when ponder regularization starts")
+parser.add_argument("--ponder-warmup-end", type=float, default=0.0, help="training progress fraction when ponder regularization reaches full strength")
+parser.add_argument("--ponder-lambda", type=float, default=0.0, help="weight for AdaPonder-style halting regularization")
+parser.add_argument("--ponder-target-frac", type=float, default=0.1, help="target fraction of tokens to prune per recurrent iteration")
+parser.add_argument("--acttail-weight", type=float, default=0.0, help="weight for recurrent-core activation sparsity regularization")
+parser.add_argument("--acttail-target", type=float, default=0.8, help="target sparsity ratio for recurrent-core activation sparsity regularization")
+parser.add_argument("--acttail-start-frac", type=float, default=0.0, help="training progress fraction when activation sparsity regularization starts")
+parser.add_argument("--acttail-scope", type=str, default="recurrent_ffn_only", help="scope for ActTail-style regularization")
+parser.add_argument("--prores-enable", action="store_true", help="enable progressive residual warmup")
+parser.add_argument("--prores-warmup-frac", type=float, default=0.05, help="training progress fraction for progressive residual warmup")
+parser.add_argument("--prores-mode", type=str, default="linear", help="progressive residual warmup mode")
+parser.add_argument("--eval-adaptive-exit-threshold", type=float, default=0.0, help="KL threshold for eval-time recurrent early exit")
+parser.add_argument("--eval-max-recurrence", type=int, default=0, help="max recurrence budget for eval-time adaptive exit")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -174,6 +189,21 @@ def build_model_meta(depth):
         n_coda=args.n_coda,
         train_recurrence=args.train_recurrence,
         k_backprop=args.k_backprop,
+        adaptive_recurrence=args.adaptive_recurrence,
+        adaptive_recurrence_eval_only=bool(args.adaptive_recurrence_eval_only),
+        ponder_stage_start=args.ponder_stage_start,
+        ponder_warmup_end=args.ponder_warmup_end,
+        ponder_lambda=args.ponder_lambda,
+        ponder_target_frac=args.ponder_target_frac,
+        acttail_weight=args.acttail_weight,
+        acttail_target=args.acttail_target,
+        acttail_start_frac=args.acttail_start_frac,
+        acttail_scope=args.acttail_scope,
+        prores_enable=args.prores_enable,
+        prores_warmup_frac=args.prores_warmup_frac,
+        prores_mode=args.prores_mode,
+        eval_adaptive_exit_threshold=args.eval_adaptive_exit_threshold,
+        eval_max_recurrence=args.eval_max_recurrence,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -408,9 +438,26 @@ def build_fresh_training_state():
 def run_training_step(model, optimizer, scaler, train_loader, x, y, grad_accum_steps, progress=None, lrm=None, muon_momentum=None, muon_weight_decay=None):
     synchronize()
     t0 = time.time()
+    ponder_lambda = 0.0 if progress is None else (
+        0.0 if args.ponder_lambda <= 0.0 or progress < args.ponder_stage_start
+        else args.ponder_lambda if progress >= args.ponder_warmup_end
+        else args.ponder_lambda * ((progress - args.ponder_stage_start) / max(args.ponder_warmup_end - args.ponder_stage_start, 1e-8))
+    )
+    acttail_weight = 0.0 if progress is None or progress < args.acttail_start_frac else args.acttail_weight
+    info_accum = {}
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y, progress=progress)
+        loss, info = model(
+            x, y,
+            progress=progress,
+            ponder_lambda_override=ponder_lambda,
+            acttail_weight_override=acttail_weight,
+            prores_progress_override=progress,
+            return_info=True,
+        )
         train_loss = loss.detach() # for logging
+        for key, value in info.items():
+            if torch.is_tensor(value):
+                info_accum[key] = info_accum.get(key, 0.0) + float(value.detach().float().item())
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -440,7 +487,7 @@ def run_training_step(model, optimizer, scaler, train_loader, x, y, grad_accum_s
     synchronize()
     t1 = time.time()
     dt = t1 - t0
-    return train_loss_f, dt, x, y, dataloader_state_dict
+    return train_loss_f, dt, x, y, dataloader_state_dict, {k: v / grad_accum_steps for k, v in info_accum.items()}
 
 
 optimizer = build_optimizer(model)
@@ -464,12 +511,12 @@ if args.time_budget_seconds > 0:
     warmup_steps = 10
     measure_steps = 20
     for step in range(warmup_steps):
-        _, _, x, y, dataloader_state_dict = run_training_step(
+        _, _, x, y, dataloader_state_dict, _ = run_training_step(
             model, optimizer, scaler, train_loader, x, y, grad_accum_steps, progress=0.0,
         )
     measured_dts = []
     for step in range(measure_steps):
-        _, dt, x, y, dataloader_state_dict = run_training_step(
+        _, dt, x, y, dataloader_state_dict, _ = run_training_step(
             model, optimizer, scaler, train_loader, x, y, grad_accum_steps, progress=0.0,
         )
         measured_dts.append(dt)
@@ -608,7 +655,15 @@ while True:
         for prompt in prompts:
             tokens = tokenizer(prompt, prepend="<|bos|>")
             with disable_fp8(orig_model):
-                sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
+                sample, _ = engine.generate_batch(
+                    tokens,
+                    num_samples=1,
+                    max_tokens=16,
+                    temperature=0,
+                    recurrence=args.eval_max_recurrence or None,
+                    adaptive_exit_threshold=args.eval_adaptive_exit_threshold or None,
+                    max_recurrence=args.eval_max_recurrence or None,
+                )
             print0(tokenizer.decode(sample[0]))
         model.train()
 
@@ -648,7 +703,7 @@ while True:
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
     muon_weight_decay = get_weight_decay(step)
-    train_loss_f, dt, x, y, dataloader_state_dict = run_training_step(
+    train_loss_f, dt, x, y, dataloader_state_dict, train_step_info = run_training_step(
         model,
         optimizer,
         scaler,
@@ -683,7 +738,9 @@ while True:
     else:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    avg_depth = train_step_info.get("avg_recurrence_depth", float(model_config.train_recurrence if model_config.n_recurrent > 0 else 1))
+    active_frac = train_step_info.get("recurrent_active_fraction", 1.0)
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | depth: {avg_depth:.2f} | active: {active_frac:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
             "step": step,
@@ -696,6 +753,22 @@ while True:
             "train/mfu": mfu,
             "train/epoch": epoch,
         }
+        for key in [
+            "avg_recurrence_depth",
+            "configured_recurrence_depth",
+            "recurrent_halted_fraction",
+            "recurrent_active_fraction",
+            "ponder_gate_mean",
+            "ponder_loss",
+            "ponder_lambda",
+            "acttail_loss",
+            "acttail_active_fraction",
+            "acttail_threshold",
+            "adaptive_exit_kl",
+            "prores_scale_mean",
+        ]:
+            if key in train_step_info:
+                log_data[f"train/{key}"] = train_step_info[key]
         if device_type == "cuda":
             log_data["train/gpu_peak_flops_bf16"] = gpu_peak_flops
         wandb_run.log(log_data)

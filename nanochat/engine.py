@@ -167,17 +167,13 @@ class Engine:
         self.tokenizer = tokenizer # needed for tool use
 
     @torch.inference_mode()
-    def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
+    def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42,
+                 recurrence=None, adaptive_exit_threshold=None, max_recurrence=None, return_info=False):
         """Same as generate, but does single prefill and then clones the KV cache."""
         assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting list of ints"
         device = self.model.get_device()
-        # NOTE: setting the dtype here and in this way is an ugly hack.
-        # Currently the repo assumes that cuda -> bfloat16 and everything else -> float32.
-        # We need to know the dtype here to call __init__ on KVCache and pre-allocate its tensors.
-        # As a quick hack, we're making generate() function inherit and know about this repo-wise assumption.
-        # I think there has to be a bigger refactor to deal with device/dtype tracking across the codebase.
-        # In particular, the KVCache should allocate its tensors lazily
-        dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+        # Match KV cache dtype to the model's embedding activations so SDPA/FA paths stay consistent.
+        dtype = self.model.transformer.wte.weight.dtype
         rng = torch.Generator(device=device)
         rng.manual_seed(seed)
 
@@ -201,7 +197,24 @@ class Engine:
             **kv_model_kwargs,
         )
         ids = torch.tensor([tokens], dtype=torch.long, device=device)
-        logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
+        prefill_out = self.model.forward(
+            ids,
+            kv_cache=kv_cache_prefill,
+            recurrence=recurrence,
+            adaptive_exit_threshold=adaptive_exit_threshold,
+            max_recurrence=max_recurrence,
+            return_info=return_info,
+        )
+        if return_info:
+            logits, info = prefill_out
+            stats = {
+                "avg_recurrence_depth_sum": float(info["avg_recurrence_depth"].item()),
+                "adaptive_exit_kl_sum": float(info["adaptive_exit_kl"].item()),
+                "steps": 1,
+            }
+        else:
+            logits = prefill_out
+            stats = None
         logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
 
         # 2) Replicate the KV cache for each sample/row
@@ -271,9 +284,31 @@ class Engine:
 
             # Prepare logits for next iteration
             ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
-            logits = self.model.forward(ids, kv_cache=kv_cache_decode)[:, -1, :]  # (B, vocab_size)
+            step_out = self.model.forward(
+                ids,
+                kv_cache=kv_cache_decode,
+                recurrence=recurrence,
+                adaptive_exit_threshold=adaptive_exit_threshold,
+                max_recurrence=max_recurrence,
+                return_info=return_info,
+            )
+            if return_info:
+                logits, info = step_out
+                stats["avg_recurrence_depth_sum"] += float(info["avg_recurrence_depth"].item())
+                stats["adaptive_exit_kl_sum"] += float(info["adaptive_exit_kl"].item())
+                stats["steps"] += 1
+            else:
+                logits = step_out
+            logits = logits[:, -1, :]  # (B, vocab_size)
 
-    def generate_batch(self, tokens, num_samples=1, **kwargs):
+        if return_info:
+            steps = max(stats["steps"], 1)
+            yield None, {
+                "avg_recurrence_depth": stats["avg_recurrence_depth_sum"] / steps,
+                "adaptive_exit_kl": stats["adaptive_exit_kl_sum"] / steps,
+            }
+
+    def generate_batch(self, tokens, num_samples=1, return_info=False, **kwargs):
         """
         Non-streaming batch generation that just returns the final token sequences.
         Returns a list of token sequences (list of lists of ints).
@@ -284,7 +319,11 @@ class Engine:
         results = [tokens.copy() for _ in range(num_samples)]
         masks = [[0] * len(tokens) for _ in range(num_samples)]
         completed = [False] * num_samples
-        for token_column, token_masks in self.generate(tokens, num_samples, **kwargs):
+        generation_info = None
+        for token_column, token_masks in self.generate(tokens, num_samples, return_info=return_info, **kwargs):
+            if return_info and token_column is None:
+                generation_info = token_masks
+                continue
             for i, (token, mask) in enumerate(zip(token_column, token_masks)):
                 if not completed[i]:
                     if token == assistant_end or token == bos:
@@ -295,6 +334,10 @@ class Engine:
             # Stop if all rows are completed
             if all(completed):
                 break
+        if return_info:
+            if generation_info is None:
+                generation_info = {"avg_recurrence_depth": 1.0, "adaptive_exit_kl": 0.0}
+            return results, masks, generation_info
         return results, masks
 
 

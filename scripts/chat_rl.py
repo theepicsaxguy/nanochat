@@ -47,6 +47,9 @@ parser.add_argument("--num-samples", type=int, default=16, help="number of sampl
 parser.add_argument("--max-new-tokens", type=int, default=256, help="max tokens to generate per sample")
 parser.add_argument("--temperature", type=float, default=1.0, help="sampling temperature")
 parser.add_argument("--top-k", type=int, default=50, help="top-k sampling (0 = disabled)")
+parser.add_argument("--rollout-recurrence", type=int, default=0, help="override recurrent depth during rollout generation (0 = checkpoint default)")
+parser.add_argument("--rollout-adaptive-exit-threshold", type=float, default=0.0, help="KL threshold for rollout-time adaptive recurrent exit")
+parser.add_argument("--rollout-max-recurrence", type=int, default=0, help="max recurrence budget for rollout-time adaptive exit (0 = disabled)")
 # Optimization
 parser.add_argument("--embedding-lr", type=float, default=0.2, help="learning rate for embedding parameters (Adam)")
 parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
@@ -111,19 +114,25 @@ def get_batch():
         model.eval() # ensure the model is in eval mode
         generated_token_sequences = []
         masks = []
+        rollout_infos = []
         num_sampling_steps = args.num_samples // args.device_batch_size # go sequentially to prevent OOMs
         for sampling_step in range(num_sampling_steps):
             seed = hash((step, example_idx, sampling_step)) & 0x7FFFFFFF # positive half of int32
-            generated_token_sequences_batch, masks_batch = engine.generate_batch(
+            generated_token_sequences_batch, masks_batch, generation_info = engine.generate_batch(
                 tokens,
                 num_samples=args.device_batch_size,
                 max_tokens=args.max_new_tokens,
                 temperature=args.temperature,
                 top_k=args.top_k,
                 seed=seed, # must make sure to change the seed for each sampling step
+                recurrence=args.rollout_recurrence or None,
+                adaptive_exit_threshold=args.rollout_adaptive_exit_threshold or None,
+                max_recurrence=args.rollout_max_recurrence or None,
+                return_info=True,
             )
             generated_token_sequences.extend(generated_token_sequences_batch)
             masks.extend(masks_batch)
+            rollout_infos.append(generation_info)
 
         # Calculate the rewards for each sample
         rewards = []
@@ -154,7 +163,13 @@ def get_batch():
         mu = rewards.mean()
         advantages = rewards - mu
         # yield inputs/targets as (B, T) of ids and rewards as (B,) of floats
-        yield generated_token_sequences, inputs, targets, rewards, advantages
+        if rollout_infos:
+            avg_rollout_depth = sum(info["avg_recurrence_depth"] for info in rollout_infos) / len(rollout_infos)
+            avg_rollout_exit_kl = sum(info["adaptive_exit_kl"] for info in rollout_infos) / len(rollout_infos)
+        else:
+            avg_rollout_depth = float(model.config.train_recurrence if model.config.n_recurrent > 0 else 1)
+            avg_rollout_exit_kl = 0.0
+        yield generated_token_sequences, inputs, targets, rewards, advantages, avg_rollout_depth, avg_rollout_exit_kl
 
 # -----------------------------------------------------------------------------
 # Simple evaluation loop for GSM8K pass@k
@@ -183,7 +198,10 @@ def run_gsm8k_eval(task, tokenizer, engine,
             num_samples=num_samples,
             max_tokens=max_completion_tokens,
             temperature=temperature,
-            top_k=top_k
+            top_k=top_k,
+            recurrence=args.rollout_recurrence or None,
+            adaptive_exit_threshold=args.rollout_adaptive_exit_threshold or None,
+            max_recurrence=args.rollout_max_recurrence or None,
         )
         # Check each sample for correctness
         outcomes = []
@@ -256,9 +274,11 @@ for step in range(num_steps):
     # Forward/Backward on rollouts over multiple examples in the dataset
     rewards_list = []
     sequence_lengths = []
+    rollout_depths = []
+    rollout_exit_kls = []
     for example_step in range(examples_per_rank):
         # Get one batch corresponding to one example in the training dataset
-        sequences_all, inputs_all, targets_all, rewards_all, advantages_all = next(batch_iterator)
+        sequences_all, inputs_all, targets_all, rewards_all, advantages_all, rollout_depth, rollout_exit_kl = next(batch_iterator)
         # Evaluate the loss and gradients
         model.train() # ensure the model is in train mode
         # We need one more loop because we can never exceed the device_batch_size
@@ -286,22 +306,34 @@ for step in range(num_steps):
         # For logging
         rewards_list.append(rewards_all.mean().item())
         sequence_lengths.extend(len(seq) for seq in sequences_all)
+        rollout_depths.append(rollout_depth)
+        rollout_exit_kls.append(rollout_exit_kl)
 
     # A bunch of logging for how the rollouts went this step
     mean_reward = sum(rewards_list) / len(rewards_list)
     mean_sequence_length = sum(sequence_lengths) / len(sequence_lengths)
+    mean_rollout_depth = 0.0 if not rollout_depths else sum(rollout_depths) / len(rollout_depths)
+    mean_rollout_exit_kl = 0.0 if not rollout_exit_kls else sum(rollout_exit_kls) / len(rollout_exit_kls)
     if ddp: # aggregate across ranks
         mean_reward_tensor = torch.tensor(mean_reward, dtype=torch.float, device=device)
         mean_sequence_length_tensor = torch.tensor(mean_sequence_length, dtype=torch.float, device=device)
+        mean_rollout_depth_tensor = torch.tensor(mean_rollout_depth, dtype=torch.float, device=device)
+        mean_rollout_exit_kl_tensor = torch.tensor(mean_rollout_exit_kl, dtype=torch.float, device=device)
         dist.all_reduce(mean_reward_tensor, op=dist.ReduceOp.AVG)
         dist.all_reduce(mean_sequence_length_tensor, op=dist.ReduceOp.AVG)
+        dist.all_reduce(mean_rollout_depth_tensor, op=dist.ReduceOp.AVG)
+        dist.all_reduce(mean_rollout_exit_kl_tensor, op=dist.ReduceOp.AVG)
         mean_reward = mean_reward_tensor.item()
         mean_sequence_length = mean_sequence_length_tensor.item()
-    print0(f"Step {step}/{num_steps} | Average reward: {mean_reward} | Average sequence length: {mean_sequence_length:.2f}")
+        mean_rollout_depth = mean_rollout_depth_tensor.item()
+        mean_rollout_exit_kl = mean_rollout_exit_kl_tensor.item()
+    print0(f"Step {step}/{num_steps} | Average reward: {mean_reward} | Average sequence length: {mean_sequence_length:.2f} | Rollout depth: {mean_rollout_depth:.2f}")
     wandb_run.log({
         "step": step,
         "reward": mean_reward,
         "sequence_length": mean_sequence_length,
+        "rollout/avg_recurrence_depth": mean_rollout_depth,
+        "rollout/adaptive_exit_kl": mean_rollout_exit_kl,
     })
 
     # Update the model parameters
@@ -328,7 +360,7 @@ for step in range(num_steps):
             model.state_dict(),
             None, # note: we don't bother to save the optimizer state
             {
-                "model_config": model_config_kwargs,
+                "model_config": dict(model.config.__dict__),
             }
         )
         print(f"✅ Saved model checkpoint to {checkpoint_dir}")
