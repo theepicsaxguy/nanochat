@@ -681,7 +681,8 @@ class GPT(nn.Module):
 
             # Recurrent core: shared block run r times
             n_pre = self.config.n_prelude
-            active_mask = torch.ones(B, T, dtype=torch.bool, device=idx.device)
+            if adaptive_training:
+                active_mask = torch.ones(B, T, dtype=torch.bool, device=idx.device)
             recurrent_active_fracs = []
             recurrent_gate_means = []
             acttail_activations = []
@@ -709,15 +710,18 @@ class GPT(nn.Module):
                     if adaptive_training:
                         x = torch.where(active_mask.unsqueeze(-1), x, prev_x)
                 recurrence_steps_used = iteration + 1
-                recurrent_active_fracs.append(active_mask.float().mean())
+                if return_info and adaptive_training:
+                    recurrent_active_fracs.append(active_mask.float().mean())
 
                 if adaptive_training and iteration < r - 1 and len(self.recurrent_gate_heads) > 0:
                     gate_head = self.recurrent_gate_heads[min(iteration, len(self.recurrent_gate_heads) - 1)]
                     gate_scores = gate_head(norm(x)).squeeze(-1)
-                    recurrent_gate_means.append(torch.sigmoid(gate_scores).mean())
+                    if return_info:
+                        recurrent_gate_means.append(torch.sigmoid(gate_scores).mean())
                     ponder_terms.append(torch.sigmoid(gate_scores[active_mask]).mean() if active_mask.any() else gate_scores.new_zeros(()))
                     active_mask, next_active_frac = self._bottomk_mask_update(gate_scores, active_mask)
-                    recurrent_active_fracs.append(next_active_frac.mean())
+                    if return_info:
+                        recurrent_active_fracs.append(next_active_frac.mean())
 
                 if enable_adaptive_exit and iteration < r - 1:
                     _, provisional_logits, _ = self._compute_adaptive_exit_logits(x, idx, x0, cos_sin, kv_cache, prores_scales)
@@ -755,18 +759,19 @@ class GPT(nn.Module):
 
             x_avg = x_avg + mix_weights[1] * x  # final output
             x = x_avg
-            info.update({
-                "avg_recurrence_depth": x.new_tensor(float(recurrence_steps_used)),
-                "configured_recurrence_depth": x.new_tensor(float(r)),
-                "recurrent_halted_fraction": x.new_tensor(1.0 - (recurrence_steps_used / max(r, 1))),
-                "recurrent_active_fraction": torch.stack(recurrent_active_fracs).mean() if recurrent_active_fracs else x.new_tensor(1.0),
-                "ponder_gate_mean": torch.stack(recurrent_gate_means).mean() if recurrent_gate_means else x.new_zeros(()),
-                "adaptive_exit_kl": exit_kl if exit_kl is not None else x.new_zeros(()),
-            })
-            if prores_scales is not None:
-                info["prores_scale_mean"] = prores_scales[n_pre:n_pre + self.config.n_recurrent].mean()
-            else:
-                info["prores_scale_mean"] = x.new_tensor(1.0)
+            if return_info:
+                info.update({
+                    "avg_recurrence_depth": x.new_tensor(float(recurrence_steps_used)),
+                    "configured_recurrence_depth": x.new_tensor(float(r)),
+                    "recurrent_halted_fraction": x.new_tensor(1.0 - (recurrence_steps_used / max(r, 1))),
+                    "recurrent_active_fraction": torch.stack(recurrent_active_fracs).mean() if recurrent_active_fracs else x.new_tensor(1.0),
+                    "ponder_gate_mean": torch.stack(recurrent_gate_means).mean() if recurrent_gate_means else x.new_zeros(()),
+                    "adaptive_exit_kl": exit_kl if exit_kl is not None else x.new_zeros(()),
+                })
+                if prores_scales is not None:
+                    info["prores_scale_mean"] = prores_scales[n_pre:n_pre + self.config.n_recurrent].mean()
+                else:
+                    info["prores_scale_mean"] = x.new_tensor(1.0)
 
         else:
             # -------------------------------------------------------
@@ -783,13 +788,14 @@ class GPT(nn.Module):
                 if targets is not None and i in self.config.dfa_layers:
                     dfa_hidden.append((i, x))
             x = x_avg
-            info["avg_recurrence_depth"] = x.new_tensor(1.0)
-            info["configured_recurrence_depth"] = x.new_tensor(1.0)
-            info["recurrent_halted_fraction"] = x.new_zeros(())
-            info["recurrent_active_fraction"] = x.new_tensor(1.0)
-            info["ponder_gate_mean"] = x.new_zeros(())
-            info["adaptive_exit_kl"] = x.new_zeros(())
-            info["prores_scale_mean"] = x.new_tensor(1.0)
+            if return_info:
+                info["avg_recurrence_depth"] = x.new_tensor(1.0)
+                info["configured_recurrence_depth"] = x.new_tensor(1.0)
+                info["recurrent_halted_fraction"] = x.new_zeros(())
+                info["recurrent_active_fraction"] = x.new_tensor(1.0)
+                info["ponder_gate_mean"] = x.new_zeros(())
+                info["adaptive_exit_kl"] = x.new_zeros(())
+                info["prores_scale_mean"] = x.new_tensor(1.0)
 
         x = norm(x)
 
@@ -842,19 +848,21 @@ class GPT(nn.Module):
                 if acttail_weight > 0.0 and 'acttail_activations' in locals():
                     acttail_loss, acttail_active_frac, acttail_threshold = self._acttail_loss(acttail_activations)
                     loss = loss + acttail_weight * acttail_loss
-                    info["acttail_loss"] = acttail_loss
-                    info["acttail_active_fraction"] = acttail_active_frac
-                    info["acttail_threshold"] = acttail_threshold
-                else:
+                    if return_info:
+                        info["acttail_loss"] = acttail_loss
+                        info["acttail_active_fraction"] = acttail_active_frac
+                        info["acttail_threshold"] = acttail_threshold
+                elif return_info:
                     info["acttail_loss"] = loss.new_zeros(())
                     info["acttail_active_fraction"] = loss.new_zeros(())
                     info["acttail_threshold"] = loss.new_zeros(())
                 if adaptive_training and ponder_lambda > 0.0 and ponder_terms:
                     ponder_loss = torch.stack(ponder_terms).mean()
                     loss = loss + ponder_lambda * ponder_loss
-                    info["ponder_loss"] = ponder_loss
-                    info["ponder_lambda"] = loss.new_tensor(ponder_lambda)
-                else:
+                    if return_info:
+                        info["ponder_loss"] = ponder_loss
+                        info["ponder_lambda"] = loss.new_tensor(ponder_lambda)
+                elif return_info:
                     info["ponder_loss"] = loss.new_zeros(())
                     info["ponder_lambda"] = loss.new_tensor(float(ponder_lambda))
             if return_info:
@@ -862,7 +870,7 @@ class GPT(nn.Module):
                 return loss, info
             return loss
         else:
-            if self.use_recurrence:
+            if return_info and self.use_recurrence:
                 info.setdefault("acttail_loss", logits.new_zeros(()))
                 info.setdefault("acttail_active_fraction", logits.new_zeros(()))
                 info.setdefault("acttail_threshold", logits.new_zeros(()))

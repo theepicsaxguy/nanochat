@@ -411,7 +411,7 @@ def build_fresh_training_state():
     return orig_model, model, optimizer, scaler, train_loader, x, y, dataloader_state_dict
 
 
-def run_training_step(model, optimizer, scaler, train_loader, x, y, grad_accum_steps, progress=None, lrm=None, muon_momentum=None, muon_weight_decay=None):
+def run_training_step(model, optimizer, scaler, train_loader, x, y, grad_accum_steps, progress=None, lrm=None, muon_momentum=None, muon_weight_decay=None, collect_info=False):
     synchronize()
     t0 = time.time()
     ponder_lambda = 0.0 if progress is None else (
@@ -422,18 +422,22 @@ def run_training_step(model, optimizer, scaler, train_loader, x, y, grad_accum_s
     acttail_weight = 0.0 if progress is None or progress < args.acttail_start_frac else args.acttail_weight
     info_accum = {}
     for micro_step in range(grad_accum_steps):
-        loss, info = model(
+        out = model(
             x, y,
             progress=progress,
             ponder_lambda_override=ponder_lambda,
             acttail_weight_override=acttail_weight,
             prores_progress_override=progress,
-            return_info=True,
+            return_info=collect_info,
         )
+        if collect_info:
+            loss, info = out
+            for key, value in info.items():
+                if torch.is_tensor(value):
+                    info_accum[key] = info_accum.get(key, 0.0) + float(value.detach().float().item())
+        else:
+            loss = out
         train_loss = loss.detach() # for logging
-        for key, value in info.items():
-            if torch.is_tensor(value):
-                info_accum[key] = info_accum.get(key, 0.0) + float(value.detach().float().item())
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -691,6 +695,7 @@ while True:
         lrm=lrm,
         muon_momentum=muon_momentum,
         muon_weight_decay=muon_weight_decay,
+        collect_info=(step % 100 == 0),
     )
     # -------------------------------------------------------------------------
 
