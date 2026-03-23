@@ -27,9 +27,14 @@ def _patch_missing_config_keys(model_config_kwargs):
         model_config_kwargs["window_pattern"] = "L"
         log0(f"Patching missing window_pattern in model config to 'L'")
 
-def _patch_missing_keys(model_data, model_config):
-    """Add default values for new parameters that may be missing in old checkpoints."""
+def patch_model_data_for_config(model_data, model_config, reference_state=None):
+    """Patch checkpoint tensors to match the current model config."""
     n_layer = model_config.n_layer
+    # Remove obsolete parameters from older/newer hybrid checkpoints.
+    for key in ["smear_gate.weight", "smear_lambda", "backout_lambda"]:
+        if key in model_data:
+            del model_data[key]
+            log0(f"Removing obsolete parameter from model data: {key}")
     # resid_lambdas defaults to 1.0 (identity scaling)
     if "resid_lambdas" not in model_data:
         model_data["resid_lambdas"] = torch.ones(n_layer)
@@ -38,6 +43,34 @@ def _patch_missing_keys(model_data, model_config):
     if "x0_lambdas" not in model_data:
         model_data["x0_lambdas"] = torch.zeros(n_layer)
         log0(f"Patching missing x0_lambdas in model data to 0.0")
+    # layer_mix defaults to last-layer-only behavior
+    if "layer_mix" not in model_data:
+        layer_mix = torch.full((n_layer + 1,), -10.0)
+        layer_mix[-1] = 0.0
+        model_data["layer_mix"] = layer_mix
+        log0("Patching missing layer_mix in model data to last-layer-dominant defaults")
+    # Adaptive recurrent tensors are synthesized from a freshly initialized model
+    # so we can keep strict checkpoint loading for older recurrent checkpoints.
+    adaptive_prefixes = (
+        "recurrent_gate_heads.",
+    )
+    if reference_state is not None:
+        patched = []
+        for key, value in reference_state.items():
+            if key in model_data:
+                continue
+            if any(key.startswith(prefix) for prefix in adaptive_prefixes):
+                model_data[key] = value.detach().clone()
+                patched.append(key)
+        if patched:
+            log0(
+                "Patching missing adaptive parameters from fresh initialization: "
+                + ", ".join(patched)
+            )
+
+def _patch_missing_keys(model_data, model_config):
+    """Backward-compatible wrapper around patch_model_data_for_config."""
+    patch_model_data_for_config(model_data, model_config)
 
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
     if rank == 0:
@@ -96,12 +129,13 @@ def build_model(checkpoint_dir, step, device, phase):
     _patch_missing_config_keys(model_config_kwargs)
     log0(f"Building model with config: {model_config_kwargs}")
     model_config = GPTConfig(**model_config_kwargs)
-    _patch_missing_keys(model_data, model_config)
     with torch.device("meta"):
         model = GPT(model_config)
     # Load the model state
     model.to_empty(device=device)
     model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
+    reference_state = model.state_dict()
+    patch_model_data_for_config(model_data, model_config, reference_state=reference_state)
     model.load_state_dict(model_data, strict=True, assign=True)
     # Put the model in the right training phase / mode
     if phase == "eval":

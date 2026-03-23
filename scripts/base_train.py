@@ -29,10 +29,10 @@ from nanochat.gpt import GPT, GPTConfig, Linear
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
+from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint, patch_model_data_for_config
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
-from nanochat.flash_attention import HAS_FA3
+from nanochat.flash_attention import describe_attention_backends
 from scripts.base_eval import evaluate_core
 print_banner()
 
@@ -47,25 +47,51 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU and torchao)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
 # Model architecture
-parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
-parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
+parser.add_argument("--depth", type=int, default=8, help="depth of the Transformer model")
+parser.add_argument("--aspect-ratio", type=int, default=32, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
-parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+parser.add_argument("--window-pattern", type=str, default="L", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+# Recurrent Depth (Huginn-style latent reasoning, arXiv:2502.05171)
+parser.add_argument("--n-prelude", type=int, default=0, help="prelude layers before shared recurrent core (0=dense)")
+parser.add_argument("--n-recurrent", type=int, default=0, help="layers in shared recurrent core (0=dense)")
+parser.add_argument("--n-coda", type=int, default=0, help="coda layers after recurrent core")
+parser.add_argument("--train-recurrence", type=int, default=4, help="fixed recurrence iterations during training")
+parser.add_argument("--k-backprop", type=int, default=4, help="last N iterations receive gradients (truncated backprop)")
+parser.add_argument("--adaptive-recurrence", action="store_true", help="enable learned token-wise halting in recurrent core")
+parser.add_argument("--adaptive-recurrence-eval-only", type=int, default=1, help="keep learned halting disabled during training and only use eval-time adaptive features")
+parser.add_argument("--ponder-stage-start", type=float, default=0.0, help="training progress fraction when ponder regularization starts")
+parser.add_argument("--ponder-warmup-end", type=float, default=0.0, help="training progress fraction when ponder regularization reaches full strength")
+parser.add_argument("--ponder-lambda", type=float, default=0.0, help="weight for AdaPonder-style halting regularization")
+parser.add_argument("--ponder-target-frac", type=float, default=0.1, help="target fraction of tokens to prune per recurrent iteration")
+parser.add_argument("--acttail-weight", type=float, default=0.0, help="weight for recurrent-core activation sparsity regularization")
+parser.add_argument("--acttail-target", type=float, default=0.8, help="target sparsity ratio for recurrent-core activation sparsity regularization")
+parser.add_argument("--acttail-start-frac", type=float, default=0.0, help="training progress fraction when activation sparsity regularization starts")
+parser.add_argument("--acttail-scope", type=str, default="recurrent_ffn_only", help="scope for ActTail-style regularization")
+parser.add_argument("--prores-enable", action="store_true", help="enable progressive residual warmup")
+parser.add_argument("--prores-warmup-frac", type=float, default=0.05, help="training progress fraction for progressive residual warmup")
+parser.add_argument("--prores-mode", type=str, default="linear", help="progressive residual warmup mode")
+parser.add_argument("--eval-adaptive-exit-threshold", type=float, default=0.0, help="KL threshold for eval-time recurrent early exit")
+parser.add_argument("--eval-max-recurrence", type=int, default=0, help="max recurrence budget for eval-time adaptive exit")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
 parser.add_argument("--target-param-data-ratio", type=float, default=10.5, help="calculate num_iterations to maintain data:param ratio (Chinchilla=20, -1 = disable)")
+parser.add_argument("--time-budget-seconds", type=float, default=-1.0, help="derive num_iterations from measured step time over a fixed wall-clock budget (-1 = disable)")
 # Optimization
-parser.add_argument("--device-batch-size", type=int, default=32, help="per-device batch size. good number to reduce to 16,8,4,... if you OOM on VRAM.")
-parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens. decent numbers are e.g. 524288. (-1 = auto-compute optimal)")
-parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
-parser.add_argument("--unembedding-lr", type=float, default=0.008, help="learning rate for unembedding parameters (Adam)")
-parser.add_argument("--weight-decay", type=float, default=0.28, help="cautious weight decay for the Muon optimizer (for weights)")
-parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
+parser.add_argument("--device-batch-size", type=int, default=16, help="per-device batch size. good number to reduce to 16,8,4,... if you OOM on VRAM.")
+parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens. decent numbers are e.g. 32768 on a single B500 laptop or 524288 on 8xH100. (-1 = auto-compute optimal)")
+parser.add_argument("--embedding-lr", type=float, default=0.4, help="learning rate for embedding parameters (Adam)")
+parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
+parser.add_argument("--weight-decay", type=float, default=0.1, help="cautious weight decay for the Muon optimizer (for weights)")
+parser.add_argument("--matrix-lr", type=float, default=0.03, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
+parser.add_argument("--dfa-layers", type=str, default="", help="comma-separated layer indices for DFA auxiliary loss (empty = disable)")
+parser.add_argument("--dfa-weight", type=float, default=0.0, help="weight for DFA auxiliary loss")
+parser.add_argument("--dfa-start-frac", type=float, default=0.0, help="training progress fraction before DFA decay begins")
+parser.add_argument("--dfa-end-frac", type=float, default=0.8, help="training progress fraction where DFA reaches zero")
 parser.add_argument("--warmup-steps", type=int, default=40, help="number of steps for LR warmup")
-parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
+parser.add_argument("--warmdown-ratio", type=float, default=0.9, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
 # Evaluation
@@ -78,6 +104,7 @@ parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
+dfa_layers = tuple(int(x) for x in args.dfa_layers.split(",")) if args.dfa_layers else ()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
@@ -91,30 +118,22 @@ if device_type == "cuda":
     gpu_device_name = torch.cuda.get_device_name(0)
     gpu_peak_flops = get_peak_flops(gpu_device_name)
     print0(f"GPU: {gpu_device_name} | Peak FLOPS (BF16): {gpu_peak_flops:.2e}")
+    print0(f"MFU basis: using {gpu_peak_flops:.2e} BF16 FLOPS per GPU across {ddp_world_size} rank(s)")
 else:
     gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
+    gpu_device_name = str(device)
 print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
+user_config["gpu_name"] = gpu_device_name
+if device_type == "cuda":
+    user_config["gpu_peak_flops_bf16"] = gpu_peak_flops
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
 
-# Flash Attention status
-from nanochat.flash_attention import USE_FA3
-using_fa3 = USE_FA3
-if using_fa3:
-    print0("✓ Using Flash Attention 3 (Hopper GPU detected), efficient, new and awesome.")
-else:
-    print0("!" * 80)
-    if HAS_FA3 and COMPUTE_DTYPE != torch.bfloat16:
-        print0(f"WARNING: Flash Attention 3 only supports bf16, but COMPUTE_DTYPE={COMPUTE_DTYPE}. Using PyTorch SDPA fallback")
-    else:
-        print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback")
-    print0("WARNING: Training will be less efficient without FA3")
-    if args.window_pattern != "L":
-        print0(f"WARNING: SDPA has no support for sliding window attention (window_pattern='{args.window_pattern}'). Your GPU utilization will be terrible.")
-        print0("WARNING: Recommend using --window-pattern L for full context attention without alternating sliding window patterns.")
-    print0("!" * 80)
+# Attention backend status
+for line in describe_attention_backends():
+    print0(line)
 
 # -----------------------------------------------------------------------------
 # Tokenizer will be useful for evaluation and also we need the vocab size to init the model
@@ -137,6 +156,30 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        dfa_layers=dfa_layers,
+        dfa_weight=args.dfa_weight,
+        dfa_start_frac=args.dfa_start_frac,
+        dfa_end_frac=args.dfa_end_frac,
+        n_prelude=args.n_prelude,
+        n_recurrent=args.n_recurrent,
+        n_coda=args.n_coda,
+        train_recurrence=args.train_recurrence,
+        k_backprop=args.k_backprop,
+        adaptive_recurrence=args.adaptive_recurrence,
+        adaptive_recurrence_eval_only=bool(args.adaptive_recurrence_eval_only),
+        ponder_stage_start=args.ponder_stage_start,
+        ponder_warmup_end=args.ponder_warmup_end,
+        ponder_lambda=args.ponder_lambda,
+        ponder_target_frac=args.ponder_target_frac,
+        acttail_weight=args.acttail_weight,
+        acttail_target=args.acttail_target,
+        acttail_start_frac=args.acttail_start_frac,
+        acttail_scope=args.acttail_scope,
+        prores_enable=args.prores_enable,
+        prores_warmup_frac=args.prores_warmup_frac,
+        prores_mode=args.prores_mode,
+        eval_adaptive_exit_threshold=args.eval_adaptive_exit_threshold,
+        eval_max_recurrence=args.eval_max_recurrence,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -155,41 +198,50 @@ base_dir = get_base_dir()
 output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
+if args.time_budget_seconds > 0 and resuming:
+    raise ValueError("--time-budget-seconds is incompatible with --resume-from-step because the timed path restarts from fresh initialization")
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
+    patch_model_data_for_config(model_data, model.config, reference_state=model.state_dict())
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
 
 # -----------------------------------------------------------------------------
 # FP8 training initialization and management (this has to be done before torch.compile)
 
-# Convert Linear layers to Float8Linear if --fp8 is set
-if args.fp8:
+def maybe_enable_fp8_training(model):
+    if not args.fp8:
+        return model
     if device_type != "cuda":
         print0("Warning: FP8 training requires CUDA, ignoring --fp8 flag")
-    else:
-        # our custom fp8 is simpler than torchao, written for exact API compatibility
-        from nanochat.fp8 import Float8LinearConfig, convert_to_float8_training
-        # from torchao.float8 import Float8LinearConfig, convert_to_float8_training
-        import torch.nn as nn
+        return model
 
-        # Filter: dims must be divisible by 16 (FP8 hardware requirement) large enough
-        def fp8_module_filter(mod: nn.Module, fqn: str) -> bool:
-            if not isinstance(mod, nn.Linear):
-                return False
-            if mod.in_features % 16 != 0 or mod.out_features % 16 != 0:
-                return False
-            if min(mod.in_features, mod.out_features) < 128:
-                return False
-            return True
+    # our custom fp8 is simpler than torchao, written for exact API compatibility
+    from nanochat.fp8 import Float8LinearConfig, convert_to_float8_training
+    # from torchao.float8 import Float8LinearConfig, convert_to_float8_training
+    import torch.nn as nn
 
-        fp8_config = Float8LinearConfig.from_recipe_name(args.fp8_recipe)
-        num_linear = sum(1 for m in model.modules() if isinstance(m, nn.Linear))
-        convert_to_float8_training(model, config=fp8_config, module_filter_fn=fp8_module_filter)
-        num_fp8 = sum(1 for m in model.modules() if 'Float8' in type(m).__name__)
-        num_skipped = num_linear - num_fp8
-        print0(f"✓ FP8 training enabled ({args.fp8_recipe} scaling) - converted {num_fp8}/{num_linear} linear layers, skipped {num_skipped} (too small)")
+    # Filter: dims must be divisible by 16 (FP8 hardware requirement) large enough
+    def fp8_module_filter(mod: nn.Module, fqn: str) -> bool:
+        if not isinstance(mod, nn.Linear):
+            return False
+        if mod.in_features % 16 != 0 or mod.out_features % 16 != 0:
+            return False
+        if min(mod.in_features, mod.out_features) < 128:
+            return False
+        return True
+
+    fp8_config = Float8LinearConfig.from_recipe_name(args.fp8_recipe)
+    num_linear = sum(1 for m in model.modules() if isinstance(m, nn.Linear))
+    convert_to_float8_training(model, config=fp8_config, module_filter_fn=fp8_module_filter)
+    num_fp8 = sum(1 for m in model.modules() if 'Float8' in type(m).__name__)
+    num_skipped = num_linear - num_fp8
+    print0(f"✓ FP8 training enabled ({args.fp8_recipe} scaling) - converted {num_fp8}/{num_linear} linear layers, skipped {num_skipped} (too small)")
+    return model
+
+
+model = maybe_enable_fp8_training(model)
 
 # Context manager to temporarily disable FP8 so that model evaluation remains in BF16
 @contextmanager
@@ -237,12 +289,6 @@ def disable_fp8(model):
         # Restore Float8Linear modules
         for parent, attr_name, fp8_module in fp8_locations:
             setattr(parent, attr_name, fp8_module)
-
-# -----------------------------------------------------------------------------
-# Compile the model
-
-orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
@@ -302,41 +348,171 @@ weight_decay_scaled = args.weight_decay * math.sqrt(total_batch_size / B_REF) * 
 if weight_decay_scaled != args.weight_decay:
     print0(f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} for depth {args.depth}")
 
-# -----------------------------------------------------------------------------
-# Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
-optimizer = model.setup_optimizer(
-    # AdamW hyperparameters
-    unembedding_lr=args.unembedding_lr * batch_lr_scale,
-    embedding_lr=args.embedding_lr * batch_lr_scale,
-    scalar_lr=args.scalar_lr * batch_lr_scale,
-    # Muon hyperparameters
-    matrix_lr=args.matrix_lr * batch_lr_scale,
-    weight_decay=weight_decay_scaled,
-)
+tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
+world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # total tokens per iteration for all ranks
+assert total_batch_size % world_tokens_per_fwdbwd == 0
+grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
+print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
+print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
+print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
+# -----------------------------------------------------------------------------
+# Compile the model
+
+def compile_training_model(model):
+    orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
+    model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+    return orig_model, model
+
+
+orig_model, model = compile_training_model(model)
+
+# -----------------------------------------------------------------------------
+# Build the optimizer, scaler, and dataloaders
+
+def build_optimizer(model):
+    return model.setup_optimizer(
+        # AdamW hyperparameters
+        unembedding_lr=args.unembedding_lr * batch_lr_scale,
+        embedding_lr=args.embedding_lr * batch_lr_scale,
+        scalar_lr=args.scalar_lr * batch_lr_scale,
+        # Muon hyperparameters
+        matrix_lr=args.matrix_lr * batch_lr_scale,
+        weight_decay=weight_decay_scaled,
+    )
+
+
+def build_scaler():
+    return torch.amp.GradScaler() if COMPUTE_DTYPE == torch.float16 else None
+
+
+def build_train_loader(resume_state_dict=None):
+    train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
+        tokenizer,
+        args.device_batch_size,
+        args.max_seq_len,
+        split="train",
+        device=device,
+        resume_state_dict=resume_state_dict,
+    )
+    x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
+    return train_loader, x, y, dataloader_state_dict
+
+
+def build_fresh_training_state():
+    model = build_model_meta(args.depth)
+    model.to_empty(device=device)
+    model.init_weights()
+    model = maybe_enable_fp8_training(model)
+    orig_model, model = compile_training_model(model)
+    optimizer = build_optimizer(model)
+    scaler = build_scaler()
+    train_loader, x, y, dataloader_state_dict = build_train_loader()
+    return orig_model, model, optimizer, scaler, train_loader, x, y, dataloader_state_dict
+
+
+def run_training_step(model, optimizer, scaler, train_loader, x, y, grad_accum_steps, progress=None, lrm=None, muon_momentum=None, muon_weight_decay=None, collect_info=False):
+    synchronize()
+    t0 = time.time()
+    ponder_lambda = 0.0 if progress is None else (
+        0.0 if args.ponder_lambda <= 0.0 or progress < args.ponder_stage_start
+        else args.ponder_lambda if progress >= args.ponder_warmup_end
+        else args.ponder_lambda * ((progress - args.ponder_stage_start) / max(args.ponder_warmup_end - args.ponder_stage_start, 1e-8))
+    )
+    acttail_weight = 0.0 if progress is None or progress < args.acttail_start_frac else args.acttail_weight
+    info_accum = {}
+    for micro_step in range(grad_accum_steps):
+        out = model(
+            x, y,
+            progress=progress,
+            ponder_lambda_override=ponder_lambda,
+            acttail_weight_override=acttail_weight,
+            prores_progress_override=progress,
+            return_info=collect_info,
+        )
+        if collect_info:
+            loss, info = out
+            for key, value in info.items():
+                if torch.is_tensor(value):
+                    info_accum[key] = info_accum.get(key, 0.0) + float(value.detach().float().item())
+        else:
+            loss = out
+        train_loss = loss.detach() # for logging
+        loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
+        if scaler is not None:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+        x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+    if lrm is not None:
+        for group in optimizer.param_groups:
+            group["lr"] = group["initial_lr"] * lrm
+            if group['kind'] == 'muon':
+                group["momentum"] = muon_momentum
+                group["weight_decay"] = muon_weight_decay
+    if scaler is not None:
+        scaler.unscale_(optimizer)
+        # In distributed training, all ranks must agree on whether to skip the step.
+        # Each rank may independently encounter inf/nan gradients, so we all-reduce
+        # the found_inf flag (MAX = if any rank found inf, all ranks skip).
+        if is_ddp_initialized():
+            for v in scaler._found_inf_per_device(optimizer).values():
+                dist.all_reduce(v, op=dist.ReduceOp.MAX)
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        optimizer.step()
+    model.zero_grad(set_to_none=True)
+    train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
+    synchronize()
+    t1 = time.time()
+    dt = t1 - t0
+    return train_loss_f, dt, x, y, dataloader_state_dict, {k: v / grad_accum_steps for k, v in info_accum.items()}
+
+
+optimizer = build_optimizer(model)
 if resuming:
     optimizer.load_state_dict(optimizer_data)
     del optimizer_data
 
-# -----------------------------------------------------------------------------
-# GradScaler for fp16 training (bf16/fp32 don't need it — bf16 has the same exponent range as fp32)
-scaler = torch.amp.GradScaler() if COMPUTE_DTYPE == torch.float16 else None
+scaler = build_scaler()
 if scaler is not None:
     print0("GradScaler enabled for fp16 training")
 
-# -----------------------------------------------------------------------------
-# Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
+train_loader, x, y, dataloader_state_dict = build_train_loader(resume_state_dict=dataloader_resume_state_dict)
 build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
-x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
 # -----------------------------------------------------------------------------
 # Calculate the number of iterations we will train for and set up the various schedulers
 
-# num_iterations: either it is given, or from target flops, or from target data:param ratio (in that order)
-assert args.num_iterations > 0 or args.target_param_data_ratio > 0 or args.target_flops > 0
-if args.num_iterations > 0:
+if args.time_budget_seconds > 0:
+    print0(f"Measuring step time from a {args.time_budget_seconds:.1f}s time budget")
+    warmup_steps = 10
+    measure_steps = 20
+    for step in range(warmup_steps):
+        _, _, x, y, dataloader_state_dict, _ = run_training_step(
+            model, optimizer, scaler, train_loader, x, y, grad_accum_steps, progress=0.0,
+        )
+    measured_dts = []
+    for step in range(measure_steps):
+        _, dt, x, y, dataloader_state_dict, _ = run_training_step(
+            model, optimizer, scaler, train_loader, x, y, grad_accum_steps, progress=0.0,
+        )
+        measured_dts.append(dt)
+    avg_dt = sum(measured_dts) / len(measured_dts)
+    num_iterations = math.floor(args.time_budget_seconds / avg_dt)
+    if num_iterations < 1:
+        raise ValueError(f"--time-budget-seconds={args.time_budget_seconds} is too small for avg_dt={avg_dt:.4f}s")
+    print0(f"Measured avg dt over {measure_steps} steps: {avg_dt * 1000:.2f}ms => num_iterations={num_iterations:,}")
+    del orig_model, model, optimizer, scaler, train_loader, x, y, dataloader_state_dict
+    gc.collect()
+    if device_type == "cuda":
+        torch.cuda.empty_cache()
+    orig_model, model, optimizer, scaler, train_loader, x, y, dataloader_state_dict = build_fresh_training_state()
+    if device_type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+elif args.num_iterations > 0:
     # Override num_iterations to a specific value if given
     num_iterations = args.num_iterations
     print0(f"Using user-provided number of iterations: {num_iterations:,}")
@@ -402,15 +578,6 @@ else:
     smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
 
-# Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step
-tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
-world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # total tokens per iteration for all ranks
-assert total_batch_size % world_tokens_per_fwdbwd == 0
-grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
-print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
-print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
-print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
-
 # Go!
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
@@ -468,7 +635,15 @@ while True:
         for prompt in prompts:
             tokens = tokenizer(prompt, prepend="<|bos|>")
             with disable_fp8(orig_model):
-                sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
+                sample, _ = engine.generate_batch(
+                    tokens,
+                    num_samples=1,
+                    max_tokens=16,
+                    temperature=0,
+                    recurrence=args.eval_max_recurrence or None,
+                    adaptive_exit_threshold=args.eval_adaptive_exit_threshold or None,
+                    max_recurrence=args.eval_max_recurrence or None,
+                )
             print0(tokenizer.decode(sample[0]))
         model.train()
 
@@ -504,43 +679,24 @@ while True:
     # -------------------------------------------------------------------------
     # single training step
     # evaluate the gradient
-    synchronize()
-    t0 = time.time()
-    for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
-        train_loss = loss.detach() # for logging
-        loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
-        if scaler is not None:
-            scaler.scale(loss).backward()
-        else:
-            loss.backward()
-        x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
-    # step the optimizer
+    progress = step / num_iterations
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
     muon_weight_decay = get_weight_decay(step)
-    for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
-        if group['kind'] == 'muon':
-            group["momentum"] = muon_momentum
-            group["weight_decay"] = muon_weight_decay
-    if scaler is not None:
-        scaler.unscale_(optimizer)
-        # In distributed training, all ranks must agree on whether to skip the step.
-        # Each rank may independently encounter inf/nan gradients, so we all-reduce
-        # the found_inf flag (MAX = if any rank found inf, all ranks skip).
-        if is_ddp_initialized():
-            for v in scaler._found_inf_per_device(optimizer).values():
-                dist.all_reduce(v, op=dist.ReduceOp.MAX)
-        scaler.step(optimizer)
-        scaler.update()
-    else:
-        optimizer.step()
-    model.zero_grad(set_to_none=True)
-    train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
-    synchronize()
-    t1 = time.time()
-    dt = t1 - t0
+    train_loss_f, dt, x, y, dataloader_state_dict, train_step_info = run_training_step(
+        model,
+        optimizer,
+        scaler,
+        train_loader,
+        x,
+        y,
+        grad_accum_steps,
+        progress=progress,
+        lrm=lrm,
+        muon_momentum=muon_momentum,
+        muon_weight_decay=muon_weight_decay,
+        collect_info=(step % 100 == 0),
+    )
     # -------------------------------------------------------------------------
 
     # logging (CPU action only)
@@ -563,7 +719,9 @@ while True:
     else:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    avg_depth = train_step_info.get("avg_recurrence_depth", float(model_config.train_recurrence if model_config.n_recurrent > 0 else 1))
+    active_frac = train_step_info.get("recurrent_active_fraction", 1.0)
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | depth: {avg_depth:.2f} | active: {active_frac:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
             "step": step,
@@ -576,6 +734,24 @@ while True:
             "train/mfu": mfu,
             "train/epoch": epoch,
         }
+        for key in [
+            "avg_recurrence_depth",
+            "configured_recurrence_depth",
+            "recurrent_halted_fraction",
+            "recurrent_active_fraction",
+            "ponder_gate_mean",
+            "ponder_loss",
+            "ponder_lambda",
+            "acttail_loss",
+            "acttail_active_fraction",
+            "acttail_threshold",
+            "adaptive_exit_kl",
+            "prores_scale_mean",
+        ]:
+            if key in train_step_info:
+                log_data[f"train/{key}"] = train_step_info[key]
+        if device_type == "cuda":
+            log_data["train/gpu_peak_flops_bf16"] = gpu_peak_flops
         wandb_run.log(log_data)
 
     # state update
@@ -609,6 +785,8 @@ get_report().log(section="Base model training", data=[
         "Number of training tokens": total_tokens,
         "Tokens : Scaling params ratio": total_batch_size * num_iterations / num_scaling_params,
         "DDP world size": ddp_world_size,
+        "GPU": gpu_device_name,
+        "Peak FLOPS (BF16 / GPU)": f"{gpu_peak_flops:.2e}" if device_type == "cuda" else None,
         "warmup_steps": args.warmup_steps,
         "warmdown_ratio": args.warmdown_ratio,
         "final_lr_frac": args.final_lr_frac,

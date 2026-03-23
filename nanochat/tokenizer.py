@@ -7,6 +7,7 @@ Two implementations are available:
 """
 
 import os
+import re
 import copy
 from functools import lru_cache
 
@@ -383,6 +384,81 @@ class RustBPETokenizer:
         assistant_start = self.encode_special("<|assistant_start|>")
         ids.append(assistant_start)
         return ids
+
+    def render_conversation_with_think(self, conversation, max_tokens=2048):
+        """
+        Like render_conversation but identifies <think>...</think> blocks in
+        assistant content and marks those tokens with mask=2 instead of mask=1.
+
+        Mask values:
+          0 = not trained (user prompts, BOS, special tokens)
+          1 = answer tokens (trained at full weight)
+          2 = thinking tokens (trained at phase-dependent weight, see chat_sft.py)
+
+        For conversations without any <think> blocks, behavior is identical to
+        render_conversation (mask values are only 0 and 1).
+        """
+        ids, mask = [], []
+
+        def add_tokens(token_ids, mask_val):
+            if isinstance(token_ids, int):
+                token_ids = [token_ids]
+            ids.extend(token_ids)
+            mask.extend([mask_val] * len(token_ids))
+
+        if conversation["messages"][0]["role"] == "system":
+            conversation = copy.deepcopy(conversation)
+            messages = conversation["messages"]
+            assert messages[1]["role"] == "user", "System message must be followed by a user message"
+            messages[1]["content"] = messages[0]["content"] + "\n\n" + messages[1]["content"]
+            messages = messages[1:]
+        else:
+            messages = conversation["messages"]
+        assert len(messages) >= 1, f"Conversation has less than 1 message: {messages}"
+
+        bos = self.get_bos_token_id()
+        user_start = self.encode_special("<|user_start|>")
+        user_end = self.encode_special("<|user_end|>")
+        assistant_start = self.encode_special("<|assistant_start|>")
+        assistant_end = self.encode_special("<|assistant_end|>")
+
+        add_tokens(bos, 0)
+        for i, message in enumerate(messages):
+            must_be_from = "user" if i % 2 == 0 else "assistant"
+            assert message["role"] == must_be_from, \
+                f"Message {i} is from {message['role']} but should be from {must_be_from}"
+
+            content = message["content"]
+
+            if message["role"] == "user":
+                assert isinstance(content, str), "User messages must be strings"
+                add_tokens(user_start, 0)
+                add_tokens(self.encode(content), 0)
+                add_tokens(user_end, 0)
+
+            elif message["role"] == "assistant":
+                add_tokens(assistant_start, 0)
+                if isinstance(content, str):
+                    # Split on <think>...</think> blocks (DOTALL so . matches newlines)
+                    parts = re.split(r'(<think>.*?</think>)', content, flags=re.DOTALL)
+                    for part in parts:
+                        if not part:
+                            continue
+                        if part.startswith('<think>') and part.endswith('</think>'):
+                            # thinking block tokens — mask=2
+                            add_tokens(self.encode(part), 2)
+                        else:
+                            # regular answer text — mask=1
+                            add_tokens(self.encode(part), 1)
+                elif isinstance(content, list):
+                    # structured content (tool calls etc.) — no think-block handling
+                    for part in content:
+                        add_tokens(self.encode(part["text"]), 1)
+                add_tokens(assistant_end, 1)
+
+        ids = ids[:max_tokens]
+        mask = mask[:max_tokens]
+        return ids, mask
 
 # -----------------------------------------------------------------------------
 # nanochat-specific convenience functions

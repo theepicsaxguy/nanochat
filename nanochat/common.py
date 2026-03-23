@@ -19,6 +19,9 @@ def _detect_compute_dtype():
     if env is not None:
         return _DTYPE_MAP[env], f"set via NANOCHAT_DTYPE={env}"
     if torch.cuda.is_available():
+        name = torch.cuda.get_device_name(0).lower()
+        if "rtx pro 500 blackwell" in name:
+            return torch.bfloat16, "auto-detected: RTX Pro 500 Blackwell (bf16 supported)"
         # bf16 requires SM 80+ (Ampere: A100, A10, etc.)
         # Older GPUs like V100 (SM 70) and T4 (SM 75) only have fp16 tensor cores
         capability = torch.cuda.get_device_capability()
@@ -234,6 +237,7 @@ def get_peak_flops(device_name: str) -> float:
         (["grace blackwell"], 2.5e15),
         (["b200"], 2.25e15),
         (["b100"], 1.8e15),
+        (["rtx pro 500 blackwell"], 9.2e12),
         # NVIDIA Hopper
         (["h200", "nvl"], 836e12),
         (["h200", "pcie"], 836e12),

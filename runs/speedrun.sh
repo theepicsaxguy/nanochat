@@ -1,11 +1,11 @@
 #!/bin/bash
 
-# This script is configured to train your own GPT-2 grade LLM (pretraining + finetuning)
-# It is designed to run on a blank 8XH100 GPU node and takes approximately 3 hours to complete.
+# This script is configured for the single-GPU laptop baseline (pretraining + finetuning).
+# It is designed to run on a machine with one RTX Pro 500 Blackwell / B500-class GPU.
 
 # 1) Example launch (simplest):
 # bash runs/speedrun.sh
-# 2) Example launch in a screen session (because the run takes ~3 hours):
+# 2) Example launch in a screen session:
 # screen -L -Logfile runs/speedrun.log -S speedrun bash runs/speedrun.sh
 # 3) Example launch with wandb logging, but see below for setting up wandb first:
 # WANDB_RUN=speedrun screen -L -Logfile runs/speedrun.log -S speedrun bash runs/speedrun.sh
@@ -69,10 +69,28 @@ python -m scripts.tok_eval
 echo "Waiting for dataset download to complete..."
 wait $DATASET_DOWNLOAD_PID
 
-# d24 model (slightly undertrained to beat GPT-2 => decrease data:params ratio from compute optimal 10.5 (default) to 8)
-torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=24 --target-param-data-ratio=8 --device-batch-size=16 --fp8 --run=$WANDB_RUN
+# Current 6GB Blackwell laptop baseline: recurrent d12 with a 4-4-4 split and
+# truncated backprop through only the last recurrent iteration. This is the
+# active single-GPU path tracked in dev/LOG.md. We keep a short wall-clock budget
+# here so speedrun remains a quick reference pipeline instead of an overnight run.
+python -m scripts.base_train \
+    --model-tag=d12 \
+    --depth=12 \
+    --n-prelude=4 \
+    --n-recurrent=4 \
+    --n-coda=4 \
+    --train-recurrence=4 \
+    --k-backprop=1 \
+    --device-batch-size=8 \
+    --total-batch-size=32768 \
+    --time-budget-seconds=300 \
+    --eval-tokens=5242880 \
+    --core-metric-every=-1 \
+    --sample-every=-1 \
+    --save-every=-1 \
+    --run=$WANDB_RUN
 # evaluate the model: CORE metric, BPB on train/val, and draw samples
-torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=16
+python -m scripts.base_eval --model-tag=d12 --device-batch-size=8
 
 # -----------------------------------------------------------------------------
 # SFT (teach the model conversation special tokens, tool use, multiple choice)
@@ -82,8 +100,8 @@ torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-
 curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
 
 # run SFT and eval the model
-torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- --device-batch-size=16 --run=$WANDB_RUN
-torchrun --standalone --nproc_per_node=8 -m scripts.chat_eval -- -i sft
+python -m scripts.chat_sft --model-tag=d12 --device-batch-size=8 --run=$WANDB_RUN
+python -m scripts.chat_eval -i sft --model-tag=d12
 
 # chat with the model over CLI! Leave out the -p to chat interactively
 # python -m scripts.chat_cli -p "Why is the sky blue?"
